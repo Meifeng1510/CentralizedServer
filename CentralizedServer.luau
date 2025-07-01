@@ -55,7 +55,7 @@ type CentralizedServer = {
 	-- This allows for custom logic to be triggered by queued items.
 	-- @returns A 'disconnect' function that, when called, will remove the callback from the list,
 	-- preventing it from being executed in the future.
-	AddMainServerCallback: (callback: <T>(value: T) -> ()) -> (() -> ()),
+	AddMainServerCallback: <T>(callback: (value: T) -> ()) -> (() -> ()),
 
 	-- Returns true if the current server instance holds the main server lock, false otherwise.
 	IsMainServer: () -> boolean,
