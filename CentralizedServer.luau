@@ -38,9 +38,6 @@
 --// Types \\--
 
 type CentralizedServer = {
-	-- A flag to check if the module has been initialized.
-	_init: boolean,
-
 	--// Public Functions \\--
 
 	-- Queues a value to be processed by the main server. If the current server is the main server,
@@ -143,6 +140,8 @@ local Callbacks: { (any) -> () } = {}
 local UpdateThread: thread? = nil
 local SessionThread: thread? = nil
 
+local Initialized = false
+
 --// Memory Store \\--
 
 -- A HashMap used to store the lock key for the main server election.
@@ -153,7 +152,7 @@ local CentralizedQueue = MemoryStoreService:GetQueue("CentralizedQueue_" .. UNIQ
 --// Class \\--
 
 local CentralizedServer = {} :: CentralizedServer
-CentralizedServer._init = false
+Initialized = false
 
 --// Private Functions \\--
 
@@ -206,7 +205,7 @@ end
 -- Checks if the module has been initialized before allowing public functions to be called.
 local function checkInit(level: number?)
 	local currentLevel = level or 1
-	if not CentralizedServer._init then
+	if not Initialized then
 		error("CentralizedServer is not initialized. Call CentralizedServer.Init() first.", currentLevel + 1)
 	end
 end
@@ -312,7 +311,7 @@ end
 
 -- Gracefully shuts down the server's roles, releasing the main server lock if held.
 local function shutdown()
-	if IsMainServer and CentralizedServer._init then
+	if IsMainServer and Initialized then
 		CentralizedServer.ReleaseServer()
 	end
 	-- Clean up background threads.
@@ -357,7 +356,6 @@ function CentralizedServer.IsMainServer()
 end
 
 function CentralizedServer.AddMainServerCallback(callback: (value: any) -> ())
-	checkInit(2)
 	if type(callback) ~= "function" then
 		error("Callback must be a function.", 2)
 	end
@@ -401,11 +399,11 @@ function CentralizedServer.ReleaseServer()
 end
 
 function CentralizedServer.Init()
-	if CentralizedServer._init then
+	if Initialized then
 		warn("CentralizedServer is already initialized.")
 		return false
 	end
-	CentralizedServer._init = true
+	Initialized = true
 
 	-- On initialization, immediately try to become the main server.
 	updateSession()
