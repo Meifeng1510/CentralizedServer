@@ -392,13 +392,17 @@ function CentralizedServer.ReleaseServer()
 	local success = retryAsync(CentralizedMemoryStore.RemoveAsync, CentralizedMemoryStore, "MainServer")
 	if success then
 		-- Notify other servers via MessagingService that they can now attempt to claim the main server role.
-		retryAsync(MessagingService.PublishAsync, MessagingService, ServerChangesTopic, "MainServerReleased")
+		retryAsync(MessagingService.PublishAsync, MessagingService, ServerChangesTopic, {
+			Type = "MainServerReleased",
+			PreviousServer = ServerId
+		})
 	end
 
 	print("[CentralizedServer] Main server lock released.")
 end
 
 function CentralizedServer.Init()
+	print("[CentralizedServer] Initializing.")
 	if Initialized then
 		warn("CentralizedServer is already initialized.")
 		return false
@@ -411,7 +415,7 @@ function CentralizedServer.Init()
 	-- Subscribe to messages indicating the main server lock has been released.
 	-- This allows for a faster takeover than waiting for the session lock to expire.
 	retryAsync(MessagingService.SubscribeAsync, MessagingService, ServerChangesTopic, function(message)
-		if message.Data == "MainServerReleased" and not IsMainServer then
+		if message.Data.Type == "MainServerReleased" and message.Data.PreviousServer ~= ServerId then
 			print("[CentralizedServer] Received release message. Attempting to become main server.")
 			updateSession()
 		end
