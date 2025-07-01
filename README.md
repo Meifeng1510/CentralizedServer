@@ -1,1 +1,3 @@
 # CentralizedServer
+
+main server yes
