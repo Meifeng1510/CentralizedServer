@@ -4,8 +4,8 @@
     Centralized Server & Distributed Queue System
     ---------------------------------------------
     Author: @meifeng_ft
-    Date: 2024-07-04 (Last Updated)
-    Version: 1.0.0
+    Date: 2024-07-03 (Last Updated)
+    Version: 0.4.2
 
     Description:
     This module provides a robust solution for managing a single "main" server
@@ -469,7 +469,11 @@ local function logMessage(message: string, severity: number?, includeTraceback: 
 		error("Invalid severity level. Must be 1 (Info), 2 (Important Info), 3 (Minor Issue), 4 (Warning), or 5 (Error).", 2)
 	end
 
-	if includeTraceback then output = output .. `\nTraceback: {debug.traceback("", 2)}` end
+	if includeTraceback then
+		output = output .. `\nTraceback: {debug.traceback("", 2)}`
+	else
+		output = output .. ` - {table.concat({debug.info(2, "nl")}, ":")}`
+	end
 
 	outputFunc(output)
 	-- Invoke all registered log callbacks with the message and severity.
@@ -2099,7 +2103,8 @@ game:BindToClose(function()
 		nThreads -= 1
 		if nThreads <= 0 then
 			logMessage("[CentralizedServer] All shutdown threads completed.", INFO_SEVERITY)
-			coroutine.resume(mainThread) -- Resume the main thread to continue shutdown.
+			-- coroutine.resume(mainThread) -- Resume the main thread to continue shutdown.
+			task.spawn(mainThread) -- Using task.spawn as using coroutine.resume will not finish game:BindToClose() properly.
 		end
 	end
 
