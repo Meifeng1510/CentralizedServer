@@ -1,46 +1,55 @@
 --!strict
 
 --[[
-	Centralized Server & Distributed Queue System
-	---------------------------------------------
-	Author: @meifeng_ft
-	Date: 2025-07-03 (Last Updated)
-	Version: 2.0.0
+    Centralized Server & Distributed Queue System
+    ---------------------------------------------
+    Author: @meifeng_ft
+    Date: 2024-07-04 (Last Updated)
+    Version: 1.0.0
 
-	Description:
-	This module provides a robust solution for managing a single "main" server
-	within a Roblox experience and multiple distributed queues for processing tasks.
-	It leverages Roblox's MemoryStoreService for server election (locking) and
-	queue management, and MessagingService for faster main server failover. 
+    Description:
+    This module provides a robust solution for managing a single "main" server
+    within a Roblox experience and multiple distributed queues for processing tasks.
+    It leverages Roblox's MemoryStoreService for server election (locking) and
+    queue management, and MessagingService for faster main server failover.
 
-	Features:
-	- **Main Server Election**: Automatically elects and maintains a single main server
-	  responsible for processing tasks from a primary, centralized queue. 
-	- **Centralized Queue**: Allows any server to queue values that are processed exclusively
-	  by the elected main server. 
-	- **Distributed Queues**: Supports multiple distributed queues where multiple servers can
-	  add items and a configurable number of servers can process them, enabling load-balanced tasks. 
-	- **Fault Tolerance**: Implements retry mechanisms with exponential backoff for
-	  MemoryStore operations, enhancing resilience against transient network issues. 
-	- **Graceful Shutdown**: Ensures the main server or processor lock is released upon server shutdown,
-	  allowing another server to quickly take over. 
-	- **Dynamic Callbacks**: Provides a mechanism for registering and unregistering callback functions
-	  for processing items from any queue. 
+    Features:
+    - **Main Server Election**: Automatically elects and maintains a single main server
+      responsible for processing tasks from a primary, centralized queue.
+    - **Centralized Queue**: Allows any server to queue values that are processed exclusively
+      by the elected main server.
+    - **Distributed Queues**: Supports multiple distributed queues where multiple servers can
+      add items and a configurable number of servers can process them, enabling load-balanced tasks.
+    - **Processor Candidacy Priority**: Allows prioritizing which servers become processors in a DistributedQueue.
+    - **Fault Tolerance**: Implements retry mechanisms with exponential backoff for
+      MemoryStore operations, enhancing resilience against transient network issues.
+    - **Graceful Shutdown**: Ensures the main server or processor lock is released upon server shutdown,
+      allowing another server to quickly take over.
+    - **Dynamic Callbacks**: Provides a mechanism for registering and unregistering callback functions
+      for processing items from any queue.
 
-	Important Notes:
-	- Relies heavily on `MemoryStoreService`. Ensure quotas are sufficient for your use case. 
-	- `MessagingService` is used for rapid main server and processor recovery and is highly recommended. 
-	- The `instanceId` parameter in constructors creates independent centralized server/queue systems. 
-	- `INVISIBILITY_TIMEOUT` and retry logic assertions are critical for preventing
-	  duplicate processing of queue items. 
+    Usage Example:
+    --------------
+	To be added.
+
+    Important Notes:
+    - Relies heavily on `MemoryStoreService`. Ensure quotas are sufficient for your use case.
+    - `MessagingService` is used for rapid main server and processor recovery and is highly recommended.
+    - The `instanceId` parameter in constructors creates independent centralized server/queue systems.
+    - `INVISIBILITY_TIMEOUT` and retry logic assertions are critical for preventing
+      duplicate processing of queue items.
 ]]
 
 --// Types \\--
 
+type proxy = typeof(newproxy(true))
+
 -- A function that processes a value from the queue.
-type Callback<T> = (value: T) -> ()
+type Callback<T...> = (T...) -> ()
 -- A list of callback functions.
-type Callbacks<T> = { Callback<T> }
+type Callbacks<T...> = { Callback<T...> }
+
+--// BaseQueue Types
 
 -- Base properties shared by all queue types.
 type BaseProperties = {
@@ -77,58 +86,101 @@ type BaseProperties = {
 
 	-- Whether this server is eligible to become the main server.
 	CanBeMainServer: boolean,
+
+	-- Whether the queue should automatically manage its lifecycle (e.g., start processing threads).
+	AutomateLifecycle: boolean,
 }
+
+-- A function that disconnects a callback or releases a lock.
+type DisconnectFunction = () -> ()
 
 -- The base interface for all queue objects.
 type BaseQueue<self, T> = {
-	-- Queues a value to be processed.
+	-- Queues a value to be processed with an optional priority.
 	-- For CentralizedQueues, only the main server will process it.
 	-- For DistributedQueues, any active processor server can process it.
-	-- @returns True if the item was successfully queued, false otherwise.
+	-- @param value The value to add to the queue. Must be JSON-serializable.
+	-- @param priority A number representing the item's priority. Higher numbers are processed first.
+	-- @returns `true` if the item was successfully queued, `false` otherwise.
 	AddToQueue: (self: self, value: T, priority: number?) -> (boolean, string?),
 
 	-- Registers a callback to execute when an item from this queue is processed.
+	-- @param callback The function to execute for each processed item.
 	-- @returns A 'disconnect' function that, when called, removes the callback.
-	AddCallback: (self: self, callback: (value: T) -> ()) -> () -> (),
+	AddCallback: (self: self, callback: (value: T) -> ()) -> DisconnectFunction,
 
-	-- Attempts to acquire or refresh the session lock for this server.
-	-- For CentralizedQueues, this is the main server election process.
-	-- For DistributedQueues, this determines if the server is a main or regular processor.
-	UpdateSession: (self: self) -> boolean,
+	-- Retrieves the current number of tasks inside the queue.
+	-- @returns The number of tasks currently present in the queue, or nil on failure.
+	GetQueueSize: (self: self) -> number?,
 
-	-- Returns true if the current server instance holds the main server lock for this queue.
+	-- The core processing method for the server.
+	-- Dequeues and processes items from the queue until it's empty
+	-- or a processing limit for a single cycle is reached.
+	-- This is intended to be called repeatedly by the server's main loop.
+	-- @returns `true` if items were successfully processed, `false` otherwise.
+	ProcessQueue: (self: self) -> boolean,
+
+	-- Checks if this server is currently the main server for the queue.
+	-- In a DistributedQueue, the main server is a special processor responsible for managing other processors.
+	-- @returns `true` if the current server instance holds the main server lock for this queue, `false` otherwise.
 	IsMainServer: (self: self) -> boolean,
+
+	-- Retrieves the JobId of the server currently designated as the main server.
+	-- @returns The JobId of the main server, or `nil` if no main server is elected.
+	GetMainServerId: (self: self) -> string?,
 
 	-- Voluntarily relinquishes the main server or processor role, allowing another server to take over.
 	-- This should be called during graceful shutdown.
+	-- @param immediateRelease If true, immediately removes the lock from MemoryStore. If false, the lock expires naturally.
 	ReleaseLock: (self: self, immediateRelease: boolean?) -> (),
 
 	-- Sets the maximum number of items to read from the queue in a single API call.
+	-- @param readCount The number of items to read. Must be between 1 and 100.
 	SetReadCount: (self: self, readCount: number) -> (),
 	-- Sets the maximum total number of items to read from the queue within one PollInterval.
+	-- @param maxReadPerInterval The maximum number of items. Use -1 for no limit.
 	SetMaxReadPerInterval: (self: self, maxReadPerInterval: number) -> (),
 	-- Sets the interval (in seconds) at which the queue is polled for new items.
+	-- @param pollInterval The polling interval in seconds. Must be greater than 0.
 	SetPollInterval: (self: self, pollInterval: number) -> (),
 
 	-- Enables or disables batching for queue reads.
+	-- @param shouldBatch True to enable batching, false to disable.
 	SetBatchEnabled: (self: self, shouldBatch: boolean) -> (),
 	-- Sets the maximum wait time (in seconds) for a batch of items to be ready before processing.
+	-- @param waitTime The maximum wait time in seconds.
 	SetBatchWaitTime: (self: self, waitTime: number) -> (),
 
 	-- Sets the expiration time (in seconds) for items in the queue.
 	-- Items will be automatically removed after this time if not processed.
+	-- @param expiration The expiration time in seconds. Must be greater than 0.
 	SetItemExpirationTime: (self: self, expiration: number) -> (),
 
 	-- Sets whether this server is eligible to become the main server. If set to false on the current
 	-- main server, it will release its lock.
+	-- @param canBeMainServer True if this server can be the main server, false otherwise.
 	SetCanBeMainServer: (self: self, canBeMainServer: boolean) -> (),
+
+	-- Sets whether the queue should automatically manage its lifecycle.
+	-- @param automateLifecycle True to enable automatic lifecycle management, false to disable.
+	SetLifecycleAutomation: (self: self, automateLifecycle: boolean) -> (),
+
+	-- Attempts to acquire or refresh the session lock for this server.
+	-- For CentralizedQueues, this is the main server election process.
+	-- For DistributedQueues, this determines if the server is a main or regular processor.
+	-- @returns `true` if the session was successfully updated, `false` otherwise.
+	UpdateSession: (self: self) -> boolean,
 
 	-- Gracefully shuts down the queue on this server, releasing any locks held.
 	Shutdown: (self: self) -> (),
 
 	-- Initializes the queue, starting session management and processing threads if applicable.
+	-- This must be called before any other methods.
+	-- @returns `true` if the queue was successfully initialized, `false` if it was already initialized.
 	Init: (self: self) -> boolean,
 } & BaseProperties
+
+--// DistributedQueue Types
 
 -- Properties specific to a DistributedQueue.
 type DistributedQueueProperties = {
@@ -139,48 +191,93 @@ type DistributedQueueProperties = {
 	MaxQueueProcessor: number,
 	-- Determines if this server is eligible to become a processor for the queue.
 	CanBeProcessor: boolean,
+
+	-- The current server's priority for processor candidacy. Lower numbers have higher priority.
+	ProcessorCandidacyPriority: number,
 }
 
 -- A queue that can be processed by multiple servers simultaneously.
 export type DistributedQueue<T> = {
-	-- Returns true if the current server is an active processor (either main or regular) for the queue.
+
+	-- Updates how processors are distributed among the available servers.
+	-- This method should be called when the set of available processors changes
+	-- (e.g., a server joins or leaves the cluster) or to periodically rebalance the load.
+	-- @returns `true` if the processors are successfully distributed, `false` otherwise.
+	UpdateProcessorDistribution: (self: DistributedQueue<T>) -> boolean,
+
+	-- Checks if the current server is an active processor for the queue.
+	-- An active processor is any server (main or regular) that processes items from the queue.
+	-- @returns `true` if the current server is an active processor for the queue.
 	IsActiveProcessor: (self: DistributedQueue<T>) -> boolean,
 
+	-- Retrieves the current active processor count for the queue.
+	-- @returns The number of active processors currently processing the queue, or nil on failure.
+	GetActiveProcessorCount: (self: DistributedQueue<T>) -> number?,
+
+	-- Retrieves a list of JobIds for the servers currently processing the queue.
+	-- @param allOrNothing If true, returns all active processors only if all the requests succeed. Otherwise, returns a partial list on failure.
+	-- @returns A list of JobIds for the active processors, or nil on failure if allOrNothing is true.
+	GetActiveProcessorList: (self: DistributedQueue<T>, allOrNothing: boolean) -> { string }?,
+
 	-- Sets the maximum number of servers that can process the queue simultaneously.
-	-- A value of -1 means there is no limit.
+	-- This can only be set before Init() is called.
+	-- @param concurrency The maximum number of processors. Use -1 for no limit.
 	SetMaxQueueProcessor: (self: DistributedQueue<T>, concurrency: number) -> (),
 
 	-- Sets whether this server is eligible to become a processor. If set to false on an active
 	-- processor, it will release its lock.
+	-- @param canBeProcessor True if this server can be a processor, false otherwise.
 	SetCanBeProcessor: (self: DistributedQueue<T>, canBeProcessor: boolean) -> (),
+
+	-- Sets the priority for the current server's processing role candidacy.
+	-- This priority is used to determine which server should become a processor first when a slot is available. Higher numbers have higher priority.
+	-- @param priority The candidacy priority.
+	SetProcessorCandidacyPriority: (self: DistributedQueue<T>, priority: number) -> (),
 } & BaseQueue<DistributedQueue<T>, T> & DistributedQueueProperties
 
--- A queue that is processed by a single, elected main server.
-export type CentralizedQueue<T> = {
-	ClassName: "CentralizedQueue",
+--// CentralizedQueue Types
 
-	-- Retrieves the JobId of the server currently designated as the main server.
-	-- Returns nil if no main server is currently elected.
-	GetMainServerId: (self: CentralizedQueue<T>) -> string?,
-} & BaseQueue<DistributedQueue<T>, T>
+-- Properties specific to a CentralizedQueue.
+type CentralizedQueueProperties = {
+	ClassName: "CentralizedQueue",
+}
+
+-- A queue that is processed by a single, elected main server.
+export type CentralizedQueue<T> = {} & BaseQueue<CentralizedQueue<T>, T> & CentralizedQueueProperties
+
+--// Constructor Types
 
 -- The public constructor interface for creating queues.
 type Constructor = {
 	-- Creates a centralized server instance where only one server processes the queue.
 	-- An optional `instanceId` can be provided to manage multiple independent systems.
+	-- @param instanceId A unique string to identify this queue system. Defaults to "global".
+	-- @returns A CentralizedQueue instance.
 	CreateCentralizedQueue: <T>(instanceId: string?) -> CentralizedQueue<T>,
 
 	-- Creates a distributed queue instance that can be processed by multiple servers.
-	CreateDistributedQueue: <T>(instanceId: string) -> DistributedQueue<T>,
+	-- @param instanceId A unique string to identify this queue system. Defaults to "global".
+	-- @returns A DistributedQueue instance.
+	CreateDistributedQueue: <T>(instanceId: string?) -> DistributedQueue<T>,
+
+	-- Sets the unique identifier for the current server instance. Defaults to game.JobId.
+	-- @param serverId A unique string to identify this server.
+	SetServerId: (serverId: string) -> (),
 
 	-- Sets the list of network errors that should be retried.
-	SetRetryableErrors: (errors: { [string]: boolean}) -> (),
+	-- This allows the retry logic to handle specific, known transient errors.
+	-- @param errors An array where values are error message substrings.
+	SetRetryableErrors: (errors: { string }) -> (),
 
 	-- Suppresses logging for a specific severity level.
-	SurpressLogLevel: (logSeverity: number) -> (),
-}
+	-- @param logSeverity The severity level to suppress (1-5).
+	SuppressLogLevel: (logSeverity: number) -> (),
 
-type proxy = typeof(newproxy(true))
+	-- Adds a callback function that will be invoked for log messages.
+	-- This allows external systems to capture and handle log messages.
+	-- @param callback A function that takes a message string and a severity level (1-5).
+	AddLogCallback: (callback: (message: string, severity: number) -> ()) -> DisconnectFunction,
+}
 
 --// Services \\--
 
@@ -190,8 +287,11 @@ local HttpService = game:GetService("HttpService")
 
 --// Variables \\--
 
--- A unique identifier to prevent conflicts with other MemoryStore and MessagingService users in the experience.
-local UNIQUE_KEY = "54fe96ac-e121-4eb9-a4c6-d2c22f1ffde4"
+local NO_LIMIT = -1
+
+-- Default to automatically managing the queue lifecycle.
+local AUTOMATE_LIFECYCLE_BY_DEFAULT = true
+
 -- The duration (in seconds) that items will persist in any queue before expiring (Default: 24 hours).
 local DEFAULT_QUEUE_EXPIRATION = 86400
 -- The delay (in seconds) for each queue processing thread to wait after it has cleared the queue.
@@ -227,15 +327,19 @@ assert(
 	"INVISIBILITY_TIMEOUT must be greater than the maximum retry duration plus the average item removal time."
 )
 
--- The maximum number of items that can be read from a MemoryStore queue in a single operation.
+-- The maximum number of items that can be read from a MemoryStoreSortedMap in a single operation.
+local MAX_MEMORY_STORE_GET_RANGE_COUNT = 200
+-- The maximum number of items that can be read from a MemoryStoreQueue in a single operation.
 local MAX_MEMORY_STORE_READ_COUNT = 100
 -- The number of items to retrieve from a queue in a single read operation.
 local DEFAULT_READ_COUNT = MAX_MEMORY_STORE_READ_COUNT
 -- The default priority for items added to a queue if not specified.
 local DEFAULT_QUEUE_PRIORITY = 0
+-- The default priority for processor candidacy in a DistributedQueue.
+local DEFAULT_PROCESSOR_CANDIDACY_PRIORITY = DEFAULT_QUEUE_PRIORITY
 -- The maximum number of items that can be read from a queue in a single interval.
--- This is set to -1 by default, meaning no limit on the number of items read.
-local DEFAULT_MAX_READ_PER_INTERVAL = -1
+-- This is set to NO_LIMIT by default, meaning no limit on the number of items read.
+local DEFAULT_MAX_READ_PER_INTERVAL = NO_LIMIT
 -- The default batch processing behavior for distributed queues.
 local ENABLE_BATCH_BY_DEFAULT = false
 -- The default wait time (in seconds) for batch processing in distributed queues.
@@ -245,24 +349,44 @@ local DEFAULT_BATCH_WAIT_TIME = 30
 assert(DEFAULT_READ_COUNT <= MAX_MEMORY_STORE_READ_COUNT, "DEFAULT_READ_COUNT must be less than or equal to MAX_MEMORY_STORE_READ_COUNT")
 
 -- MessagingService topics for notifying servers of state changes.
-local DISTRIBUTED_QUEUE_CHANGES_TOPIC = `DistributedQueue_ServerChanges_{UNIQUE_KEY}`
-local CENTRALIZED_QUEUE_CHANGES_TOPIC = `CentralizedQueue_ServerChanges_{UNIQUE_KEY}`
+local DISTRIBUTED_QUEUE_CHANGES_TOPIC = `DistributedQueue_ServerChanges`
+local CENTRALIZED_QUEUE_CHANGES_TOPIC = `CentralizedQueue_ServerChanges`
+
+local MEMORY_STORE_LOCK_FORMAT = `%s_LOCK_%s` -- Format for MemoryStore lock names, where %s is the queue type and %s is the instance ID.
+local MEMORY_STORE_QUEUE_FORMAT = `%s_TASK_QUEUE_%s` -- Format for MemoryStore queue names, where %s is the queue type and %s is the instance ID.
+local MEMORY_STORE_PROCESSOR_DISTRIBUTION_QUEUE_FORMAT = `PROCESSOR_DISTRIBUTION_QUEUE_%s` -- Format for processor distribution queues, where %s is the instance ID.
+
+-- The maximum length for an instance ID in queue names.
+-- This is used to ensure that memory store names do not exceed Roblox's limits (50 characters).
+local MAX_INSTANCE_ID_LENGTH = 21
 
 -- Default settings for server eligibility.
 local DEFAULT_CAN_BE_MAIN_SERVER = true -- Default to allowing servers to become the main server.
-local DEFAULT_MAX_QUEUE_PROCESSOR = -1 -- Default to no limit on the number of servers processing the queue.
+local DEFAULT_MAX_QUEUE_PROCESSOR = NO_LIMIT -- Default to no limit on the number of servers processing the queue.
 local DEFAULT_CAN_BE_PROCESSOR = true -- Default to allowing servers to process the queue.
 
 --// Mapping & State
 
--- Internal indices for accessing properties within the proxy's internal table.
+-- Configuration / Initialization
 local INDEX_PROTOTYPE = 1 -- The prototype table for the queue object.
-local INDEX_CALLBACKS = 2 -- The list of registered callback functions.
+local INDEX_INITIALIZED = 2 -- A boolean flag indicating if Init() has been called.
+
+-- MemoryStore components
 local INDEX_MEMORY_STORE_LOCK = 3 -- The MemoryStore (HashMap or SortedMap) used for session locking.
 local INDEX_MEMORY_STORE_QUEUE = 4 -- The MemoryStoreQueue used for items.
-local INDEX_SERVER_ID = 5 -- The role of the current server (e.g., MAIN_SERVER, PROCESSOR_SERVER).
-local INDEX_UPDATE_THREAD = 6 -- The coroutine handling queue processing.
-local INDEX_INITIALIZED = 7 -- A boolean flag indicating if Init() has been called.
+
+-- Server role & distribution
+local INDEX_MAIN_SERVER_ID = 5 -- The JobId of the main server instance.
+local INDEX_SERVER_ROLE = 6 -- The role of the current server (e.g., MAIN_SERVER, PROCESSOR_SERVER).
+
+-- Callbacks and processing
+local INDEX_CALLBACKS = 7 -- The list of registered callback functions.
+local INDEX_UPDATE_THREAD = 8 -- The coroutine handling queue processing.
+local INDEX_DISTRIBUTION_THREAD = 9 -- The coroutine handling processor distribution for DistributedQueues.
+local INDEX_UPDATE_FLAG = 10 -- A flag indicating if the update thread is currently running.
+
+-- MessagingService components
+local INDEX_SUBSCRIPTION = 11 -- The MessagingService subscription for queue updates.
 
 -- Represents the different roles a server can have for a given queue.
 local NON_PROCESSOR_SERVER = 0 -- Server does not process the queue.
@@ -272,12 +396,12 @@ local MAIN_SERVER = 2 -- Server is the main processor for a DistributedQueue or 
 -- Severity levels for logging messages.
 local INFO_SEVERITY = 1 -- Informational messages.
 local IMPORTANT_INFO_SEVERITY = 2 -- Important informational messages that may require attention.
-local MINOR_ISSUE_SEVERITY = 3 -- Minor issues that do not affect functionality.
+local MINOR_ISSUE_SEVERITY = 3 -- Minor issues that does not include logical errors (network errors).
 local WARNING_SEVERITY = 4 -- Warnings that may indicate potential issues.
 local ERROR_SEVERITY = 5 -- Critical errors that require attention.
 
 -- The unique identifier for the current server instance.
-local ServerId = game.JobId
+local ServerId: string = game.JobId
 -- Maps a queue proxy object to its internal properties table.
 local ProxyMap: { [proxy]: BaseProperties & DistributedQueueProperties } = {}
 -- Maps a unique queue name (ClassName_InstanceId) to its proxy object to prevent duplicates.
@@ -290,16 +414,27 @@ local Constructor: Constructor = {} :: Constructor
 local ActiveSessionQueues: { CentralizedQueue<any> | DistributedQueue<any> } = {}
 
 -- A list of specific error message substrings that signify transient network issues, which are safe to retry.
--- This is currently unpopulated as Roblox does not provide specific error codes for MemoryStoreService and MessagingService.
 -- It can be populated by the user to include any known retryable errors.
-local RetryableNetworkErrors
-local SurpressedLogLevels: { [number]: boolean } = {
+local RetryableNetworkErrors: { string } = {
+	--// MemoryStoreService errors
+	"TotalRequestsOverLimit",
+	"InternalError",
+	"Throttled",
+	"PartitionRequestsOverLimit",
+	"Timeout",
+
+	--// MessagingService errors
+	"Too many publish request",
+}
+
+local SuppressedLogLevels: { [number]: boolean } = {
 	[INFO_SEVERITY] = false,
 	[IMPORTANT_INFO_SEVERITY] = false,
 	[MINOR_ISSUE_SEVERITY] = false,
 	[WARNING_SEVERITY] = false,
 	[ERROR_SEVERITY] = false,
 }
+local LogCallbacks: Callbacks<string, number> = {} -- Callbacks for log messages.
 
 --// Private Functions \\--
 
@@ -312,7 +447,7 @@ end
 local function logMessage(message: string, severity: number?, includeTraceback: boolean?)
 	local messageSeverity = severity or INFO_SEVERITY
 
-	if SurpressedLogLevels[messageSeverity] then return end -- Skip logging if this severity is suppressed.
+	if SuppressedLogLevels[messageSeverity] then return end -- Skip logging if this severity is suppressed.
 
 	local output, outputFunc: (string) -> ()
 	if messageSeverity == INFO_SEVERITY then
@@ -331,12 +466,16 @@ local function logMessage(message: string, severity: number?, includeTraceback: 
 		output = `[Error] {message}`
 		outputFunc = createErrorOutput
 	else
-		error("Invalid severity level. Must be 1 (Info), 2 (Issue), 3 (Warning), or 4 (Error).", 2)
+		error("Invalid severity level. Must be 1 (Info), 2 (Important Info), 3 (Minor Issue), 4 (Warning), or 5 (Error).", 2)
 	end
 
-	if includeTraceback then output = output .. `\nTraceback: {debug.traceback()}` end
+	if includeTraceback then output = output .. `\nTraceback: {debug.traceback("", 2)}` end
 
 	outputFunc(output)
+	-- Invoke all registered log callbacks with the message and severity.
+	for _, callback in LogCallbacks do
+		task.spawn(callback, message, messageSeverity)
+	end
 end
 
 -- A utility to capture and yield the results of a function call from within a coroutine.
@@ -363,10 +502,10 @@ local function retryAsync<T..., R...>(func: (T...) -> R..., ...: T...): (boolean
 		local _, errorMsg: any = coroutine.resume(thread)
 
 		-- Retry only if there are defined retryable errors.
-		if RetryableNetworkErrors and next(RetryableNetworkErrors) ~= nil then
+		if RetryableNetworkErrors and #RetryableNetworkErrors > 0 then
 			local shouldRetry = false
 
-			for errorCode in RetryableNetworkErrors do
+			for _, errorCode in RetryableNetworkErrors do
 				if errorMsg:find(errorCode) then
 					shouldRetry = true
 					break
@@ -377,9 +516,18 @@ local function retryAsync<T..., R...>(func: (T...) -> R..., ...: T...): (boolean
 				logMessage(`[Retry] Non-retryable error for function '{func}': {errorMsg}`, ERROR_SEVERITY, true)
 				return false, errorMsg -- Non-retryable error.
 			end
-		end
 
-		logMessage(`[Retry] Network operation failed for function '{func}', attempt ({retryAttempt}/{MAX_ATTEMPTS}): {errorMsg}`, MINOR_ISSUE_SEVERITY)
+			logMessage(
+				`[Retry] Network operation failed for function '{func}', attempt ({retryAttempt}/{MAX_ATTEMPTS}): {errorMsg}`,
+				MINOR_ISSUE_SEVERITY
+			)
+		else
+			logMessage(
+				`[Retry] No retryable errors defined. Function '{func}' failed with: {errorMsg}, attempt ({retryAttempt}/{MAX_ATTEMPTS})`,
+				WARNING_SEVERITY,
+				true
+			)
+		end
 
 		-- Wait longer before the next attempt.
 		task.wait(RETRY_INTERVAL * retryAttempt ^ EXPONENTIAL_BACKOFF)
@@ -423,63 +571,94 @@ local function getQueueProperties(self: proxy): BaseProperties & DistributedQueu
 	return queueProperties
 end
 
+local function processQueue(properties: BaseProperties): boolean
+	local memoryStoreQueue = properties[INDEX_MEMORY_STORE_QUEUE] :: MemoryStoreQueue
+	local callbacks = properties[INDEX_CALLBACKS]
+
+	-- Read a batch of items from the queue.
+	local readCount = properties.ReadCount
+	local maxReadPerInterval = properties.MaxReadPerInterval
+	local batchWaitTime = if properties.BatchEnabled then properties.BatchWaitTime else 0
+	local itemsProcessedThisInterval = 0
+
+	local processSuccess = false
+
+	while maxReadPerInterval == NO_LIMIT or itemsProcessedThisInterval < maxReadPerInterval do
+		local readAmount = if maxReadPerInterval == NO_LIMIT
+			then readCount
+			else math.min(readCount, maxReadPerInterval - itemsProcessedThisInterval)
+		if readAmount <= 0 then break end
+
+		local success, items: { any }?, id: string? =
+			retryAsync(memoryStoreQueue.ReadAsync, memoryStoreQueue, readAmount, false, batchWaitTime)
+
+		if success then
+			if not (items and id) then
+				logMessage(`[{properties.ClassName}][{properties.InstanceId}] No items read from queue. Queue may be empty.`, INFO_SEVERITY)
+				processSuccess = true
+				break
+			end
+
+			local nItems = #items
+			if nItems == 0 then -- Queue is empty.
+				processSuccess = true
+				break
+			end
+
+			itemsProcessedThisInterval += nItems
+
+			-- If read is successful, permanently remove the items to prevent reprocessing.
+			local removeSuccess, removeError: string? = retryAsync(memoryStoreQueue.RemoveAsync, memoryStoreQueue, id)
+			if not removeSuccess then
+				logMessage(
+					`[{properties.ClassName}][{properties.InstanceId}] Failed to remove items from queue after reading. Items may be processed again. Error: {removeError}`,
+					MINOR_ISSUE_SEVERITY
+				)
+				break
+			end
+
+			executeCallbacks(callbacks, items)
+			logMessage(`[{properties.ClassName}][{properties.InstanceId}] Processed {nItems} items from the queue.`, INFO_SEVERITY)
+
+			-- If we read fewer items than requested, it indicates the queue is now empty.
+			if nItems < readAmount then
+				processSuccess = true
+				break
+			end
+		else
+			logMessage(`[{properties.ClassName}][{properties.InstanceId}] Failed to read from queue: {items}`, INFO_SEVERITY)
+			-- Break on read failure to avoid a tight loop of failed reads.
+			break
+		end
+	end
+
+	return processSuccess
+end
+
 -- Creates and starts the main processing thread for a queue.
-local function createUpdateThread(properties: BaseProperties & DistributedQueueProperties)
+local function startUpdateThread(properties: BaseProperties)
 	if properties[INDEX_UPDATE_THREAD] then return end -- Avoid starting multiple threads.
-	if properties.MaxQueueProcessor ~= -1 and properties[INDEX_SERVER_ID] == NON_PROCESSOR_SERVER then
+	if properties[INDEX_SERVER_ROLE] == NON_PROCESSOR_SERVER then
 		logMessage(`[{properties.ClassName}] Attempted to start update thread, but this is not a processor server.`, WARNING_SEVERITY, true)
 		return
 	end
+	if properties.AutomateLifecycle == false then
+		logMessage(
+			`[{properties.ClassName}][{properties.InstanceId}] Lifecycle automation is disabled. Not starting update thread.`,
+			WARNING_SEVERITY,
+			true
+		)
+		return
+	end
 
-	local memoryStoreQueue = properties[INDEX_MEMORY_STORE_QUEUE] :: MemoryStoreQueue
-	logMessage(`[{properties.ClassName}][{properties.InstanceId}] This server is now an active processor. Starting queue processing.`, INFO_SEVERITY)
-
-	local callbacks = properties[INDEX_CALLBACKS]
+	logMessage(
+		`[{properties.ClassName}][{properties.InstanceId}] This server is now an active processor. Starting queue processing.`,
+		INFO_SEVERITY
+	)
 
 	properties[INDEX_UPDATE_THREAD] = task.spawn(function()
 		while true do
-			-- Read a batch of items from the queue.
-			local readCount = properties.ReadCount
-			local maxReadPerInterval = properties.MaxReadPerInterval
-			local batchWaitTime = if properties.BatchEnabled then properties.BatchWaitTime else 0
-			local itemsProcessedThisInterval = 0
-
-			while maxReadPerInterval == -1 or itemsProcessedThisInterval < maxReadPerInterval do
-				local readAmount = if maxReadPerInterval == -1
-					then readCount
-					else math.min(readCount, maxReadPerInterval - itemsProcessedThisInterval)
-				if readAmount <= 0 then break end
-
-				local success, items, id: any = retryAsync(memoryStoreQueue.ReadAsync, memoryStoreQueue, readAmount, false, batchWaitTime)
-
-				if success then
-					local nItems = #items
-					if nItems == 0 then break end -- Queue is empty.
-
-					itemsProcessedThisInterval += nItems
-
-					-- If read is successful, permanently remove the items to prevent reprocessing.
-					local removeSuccess, removeError = retryAsync(memoryStoreQueue.RemoveAsync, memoryStoreQueue, id)
-					if not removeSuccess then
-						logMessage(
-							`[{properties.ClassName}][{properties.InstanceId}] Failed to remove items from queue after reading. Items may be processed again. Error: {removeError}`,
-							MINOR_ISSUE_SEVERITY
-						)
-						break
-					end
-
-					executeCallbacks(callbacks, items)
-					logMessage(`[{properties.ClassName}][{properties.InstanceId}] Processed {nItems} items from the queue.`, MINOR_ISSUE_SEVERITY)
-
-					-- If we read fewer items than requested, it indicates the queue is now empty.
-					if nItems < readAmount then break end
-				else
-					logMessage(`[{properties.ClassName}][{properties.InstanceId}] Failed to read from queue: {items}`, INFO_SEVERITY)
-					-- Break on read failure to avoid a tight loop of failed reads.
-					break
-				end
-			end
-
+			processQueue(properties)
 			task.wait(properties.PollInterval) -- Wait before processing the next batch.
 		end
 	end)
@@ -499,43 +678,47 @@ end
 
 -- Metatable for all queue objects, delegating key access to their internal properties table.
 local ClassMetatable = {
-	__index = function(self: proxy, key)
-		local properties = getQueueProperties(self)
-		local value = properties[key]
-		if value then return value end
+	__index = function(self: proxy, key: any)
+		local properties = ProxyMap[self]
+		if properties == nil then error(`Attempted to access a destroyed object: {self} - {key}`, 2) end
+		if type(key) ~= "string" then error("Index must be a string.", 2) end
 
-		return properties[INDEX_PROTOTYPE][key]
+		local value = properties[key]
+		if value ~= nil then return value end
+
+		local func = properties[INDEX_PROTOTYPE][key]
+		if func then return func end
+
+		error(`{key} is not a valid member of {properties.ClassName} {properties.InstanceId}`, 2)
+	end,
+	__newindex = function(self: proxy, key: any, value: any)
+		local properties = getQueueProperties(self)
+		error(`Cannot set {key} on {properties.ClassName} {properties.InstanceId}. Class is read-only.`, 2)
 	end,
 	__tostring = function(self: proxy)
-		local properties = getQueueProperties(self)
+		local properties = ProxyMap[self]
+		if properties == nil then return `DestroyedQueue` end
 		return `{properties.ClassName}_{properties and properties.InstanceId or "Unknown"}`
 	end,
 	__metatable = "Locked.",
 }
 
--- Metatable for queue objects after they have been destroyed to prevent use-after-destroy errors.
-local DestroyedObjectMetatable = {
-	__index = function(self: proxy, key)
-		error(`Attempted to access a destroyed object: {self} - {key}`, 2)
-	end,
-	__tostring = function(self: proxy)
-		return `DestroyedQueue: {self}`
-	end,
-	__metatable = "Locked.",
-}
-
 -- The default template for creating the internal properties table of a new queue instance.
-local BASE_QUEUE_TEMPLATE: { [any]: any } = table.freeze({
+local BASE_QUEUE_TEMPLATE: { [any]: any } = {
 	[INDEX_PROTOTYPE] = nil,
-	[INDEX_CALLBACKS] = nil,
+	[INDEX_INITIALIZED] = false,
 	[INDEX_MEMORY_STORE_LOCK] = nil,
 	[INDEX_MEMORY_STORE_QUEUE] = nil,
-	[INDEX_SERVER_ID] = nil,
+	[INDEX_MAIN_SERVER_ID] = nil,
+	[INDEX_SERVER_ROLE] = nil,
+	[INDEX_CALLBACKS] = nil,
 	[INDEX_UPDATE_THREAD] = nil,
-	[INDEX_INITIALIZED] = nil,
+	[INDEX_DISTRIBUTION_THREAD] = nil,
+	[INDEX_UPDATE_FLAG] = false,
+	[INDEX_SUBSCRIPTION] = nil,
 
 	InstanceId = "global",
-	ClassName = "DistributedQueue",
+	ClassName = "BaseQueue",
 	ReadCount = DEFAULT_READ_COUNT,
 	MaxReadPerInterval = DEFAULT_MAX_READ_PER_INTERVAL,
 	PollInterval = DEFAULT_QUEUE_POLL_INTERVAL,
@@ -543,7 +726,11 @@ local BASE_QUEUE_TEMPLATE: { [any]: any } = table.freeze({
 	BatchWaitTime = DEFAULT_BATCH_WAIT_TIME,
 	ItemExpirationTime = DEFAULT_QUEUE_EXPIRATION,
 	CanBeMainServer = DEFAULT_CAN_BE_MAIN_SERVER,
-})
+	AutomateLifecycle = AUTOMATE_LIFECYCLE_BY_DEFAULT,
+}
+
+table.freeze(BASE_QUEUE_TEMPLATE) -- Prevent modification of the base template.
+table.freeze(ClassMetatable)
 
 --// BaseQueue Prototype \\--
 
@@ -561,12 +748,14 @@ function BaseQueuePrototype:AddToQueue<T>(value: T, priority: number?): (boolean
 	local queue = properties[INDEX_MEMORY_STORE_QUEUE] :: MemoryStoreQueue
 	logMessage(`[{self.ClassName}][{self.InstanceId}] Adding item to queue.`, INFO_SEVERITY)
 
-	local success, errorMsg = retryAsync(queue.AddAsync, queue, value, priority or DEFAULT_QUEUE_PRIORITY, properties.ItemExpirationTime)
+	local success, errorMsg: string? =
+		retryAsync(queue.AddAsync, queue, value, properties.ItemExpirationTime, priority or DEFAULT_QUEUE_PRIORITY)
 	if not success then
 		logMessage(`[{self.ClassName}][{self.InstanceId}] Failed to add item to queue: {errorMsg}`, MINOR_ISSUE_SEVERITY)
 		return false, errorMsg
 	end
 
+	logMessage(`[{self.ClassName}][{self.InstanceId}] Item added to queue successfully.`, INFO_SEVERITY)
 	return true
 end
 
@@ -580,17 +769,58 @@ function BaseQueuePrototype:AddCallback<T>(callback: Callback<T>): () -> ()
 	local disconnected = false
 	return function()
 		if disconnected then
-			logMessage(`[{self.ClassName}][{self.InstanceId}] Callback already disconnected.`, WARNING_SEVERITY)
+			logMessage(`[{self.ClassName}][{self.InstanceId}] Callback already disconnected.`, WARNING_SEVERITY, true)
 			return
 		end
-		disconnected = true
 
 		local index = table.find(callbacks, callback)
 		if index then
 			logMessage(`[{self.ClassName}][{self.InstanceId}] Disconnecting a callback.`, INFO_SEVERITY)
 			table.remove(callbacks, index)
 		end
+
+		disconnected = true
 	end
+end
+
+function BaseQueuePrototype:GetQueueSize(): number?
+	local properties = getQueueProperties(self)
+	checkInit(properties[INDEX_INITIALIZED], 2)
+
+	local memoryStoreQueue = properties[INDEX_MEMORY_STORE_QUEUE] :: MemoryStoreQueue
+	local success, size: number? = retryAsync(memoryStoreQueue.GetSizeAsync, memoryStoreQueue)
+	if not success then
+		logMessage(`[{self.ClassName}][{self.InstanceId}] Failed to get queue size.`, MINOR_ISSUE_SEVERITY)
+		return nil
+	end
+
+	return size
+end
+
+function BaseQueuePrototype:ProcessQueue()
+	local properties = getQueueProperties(self)
+	checkInit(properties[INDEX_INITIALIZED], 2)
+
+	if properties[INDEX_SERVER_ROLE] == NON_PROCESSOR_SERVER then
+		logMessage(`[{self.ClassName}][{self.InstanceId}] This server is not a processor. Cannot process queue.`, WARNING_SEVERITY, true)
+		return false
+	end
+
+	logMessage(`[{self.ClassName}][{self.InstanceId}] Processing queue...`, INFO_SEVERITY)
+	return processQueue(properties)
+end
+
+function BaseQueuePrototype:IsMainServer()
+	local properties = getQueueProperties(self)
+	checkInit(properties[INDEX_INITIALIZED], 2)
+
+	return properties[INDEX_SERVER_ROLE] == MAIN_SERVER
+end
+
+function BaseQueuePrototype:GetMainServerId(): string?
+	local properties = getQueueProperties(self)
+	checkInit(properties[INDEX_INITIALIZED], 2)
+	return properties[INDEX_MAIN_SERVER_ID]
 end
 
 function BaseQueuePrototype:SetReadCount(readCount: number)
@@ -607,7 +837,7 @@ end
 function BaseQueuePrototype:SetMaxReadPerInterval(maxReadPerInterval: number)
 	local properties = getQueueProperties(self)
 	if type(maxReadPerInterval) ~= "number" then error("Max read per interval must be a number.", 2) end
-	if maxReadPerInterval ~= -1 and maxReadPerInterval < 1 then error("Invalid max read per interval.", 2) end
+	if maxReadPerInterval ~= NO_LIMIT and maxReadPerInterval < 1 then error("Invalid max read per interval.", 2) end
 	properties.MaxReadPerInterval = maxReadPerInterval
 end
 
@@ -627,7 +857,7 @@ end
 function BaseQueuePrototype:SetBatchWaitTime(waitTime: number)
 	local properties = getQueueProperties(self)
 	if type(waitTime) ~= "number" then error("Batch wait time must be a number.", 2) end
-	properties.BatchWaitTime = waitTime or 0
+	properties.BatchWaitTime = waitTime
 end
 
 function BaseQueuePrototype:SetItemExpirationTime(expiration: number)
@@ -642,7 +872,7 @@ function BaseQueuePrototype:SetCanBeMainServer(canBeMainServer: boolean)
 	if type(canBeMainServer) ~= "boolean" then error("Can be main server must be a boolean.", 2) end
 	properties.CanBeMainServer = canBeMainServer
 
-	if not canBeMainServer and properties[INDEX_SERVER_ID] == MAIN_SERVER then
+	if not canBeMainServer and (properties[INDEX_SERVER_ROLE] == MAIN_SERVER) then
 		logMessage(`[{self.ClassName}][{self.InstanceId}] CanBeMainServer set to false. Releasing main server lock.`, INFO_SEVERITY)
 		self:ReleaseLock(true)
 	end
@@ -655,15 +885,36 @@ function BaseQueuePrototype:Shutdown()
 	local index = table.find(ActiveSessionQueues, self)
 	if index then table.remove(ActiveSessionQueues, index) end
 
-	if properties[INDEX_SERVER_ID] == ServerId then self:ReleaseLock(true) end
+	if properties[INDEX_SUBSCRIPTION] then
+		properties[INDEX_SUBSCRIPTION]:Disconnect()
+		properties[INDEX_SUBSCRIPTION] = nil
+	end
 
-	stopUpdateThread(properties) -- Ensure update thread is stopped
+	if properties[INDEX_UPDATE_FLAG] then task.cancel(properties[INDEX_UPDATE_FLAG]) end
 
-	logMessage(`[{self.ClassName}][{self.InstanceId}] Shutdown complete.`, INFO_SEVERITY)
-	setmetatable(self, DestroyedObjectMetatable) -- Prevent further access to the queue.
+	local serverRole = properties[INDEX_SERVER_ROLE]
+	if serverRole == MAIN_SERVER then
+		logMessage(`[{self.ClassName}][{self.InstanceId}] This server is the main server. Releasing main server lock.`, INFO_SEVERITY)
+		self:ReleaseLock(true)
+	elseif serverRole == PROCESSOR_SERVER then
+		logMessage(`[{self.ClassName}][{self.InstanceId}] This server is a processor. Releasing processor lock.`, INFO_SEVERITY)
+		self:ReleaseLock(false)
+	else
+		logMessage(`[{self.ClassName}][{self.InstanceId}] This server is non-processor. No lock to release.`, INFO_SEVERITY)
+	end
+
+	local entryName = `{properties.ClassName}_{properties.InstanceId}`
+	BaseQueueMap[entryName] = nil
+	ProxyMap[self] = nil
+
+	logMessage(`[{properties.ClassName}][{properties.InstanceId}] Shutdown complete.`, IMPORTANT_INFO_SEVERITY)
+
+	table.clear(properties)
+	table.freeze(properties)
 end
 
 table.freeze(BaseQueuePrototype)
+table.freeze(BaseQueueMetatable)
 
 --// Constructors \\--
 
@@ -671,17 +922,21 @@ table.freeze(BaseQueuePrototype)
 local function createBaseQueue<T>(
 	instanceId: string?,
 	className: string
-): (BaseQueue<proxy, T>, string, (BaseProperties & DistributedQueueProperties)?)
+): (BaseQueue<proxy, T>, (BaseProperties & DistributedQueueProperties)?)
 	local id = instanceId or "global"
+	if type(id) ~= "string" then error("InstanceId must be a string.", 3) end
+	if #id > MAX_INSTANCE_ID_LENGTH then error(`InstanceId "{id}" exceeds maximum length of {MAX_INSTANCE_ID_LENGTH} characters.`, 3) end
+
 	local entryName = `{className}_{id}`
 	local existingQueue = BaseQueueMap[entryName]
 
 	if existingQueue then
 		logMessage(`{className} with instanceId "{id}" already exists. Using existing instance.`, WARNING_SEVERITY)
-		return existingQueue, id
+		return existingQueue
 	end
 
 	logMessage(`Creating new {className} with instanceId "{id}".`, INFO_SEVERITY)
+
 	local proxy = newproxy(true)
 	local properties = table.clone(BASE_QUEUE_TEMPLATE)
 
@@ -691,17 +946,23 @@ local function createBaseQueue<T>(
 	BaseQueueMap[entryName] = proxy
 	ProxyMap[proxy] = properties
 
-	return setmetatable(proxy, ClassMetatable), id, properties
+	local proxyMetatable = getmetatable(proxy)
+	for key, value in ClassMetatable do
+		proxyMetatable[key] = value
+	end
+
+	table.freeze(proxyMetatable) -- Prevent modification of the metatable.
+	return proxy, properties
 end
 
 --// Subclasses \\--
 
 do -- DistributedQueue
 	--[[
-		A DistributedQueue allows multiple servers to process items concurrently. 
+		A DistributedQueue allows multiple servers to process items concurrently.
 		Each server can add items to the queue, and a specific number of servers (processors)
 		can process them.  The queue is managed using MemoryStoreService.  Servers can become
-		processors based on a defined concurrency limit. 
+		processors based on a defined concurrency limit.
 
 		A single "main" server is elected among the processors. Only this main server can
 		approve new servers to become processors.  This prevents a race condition where multiple
@@ -713,29 +974,322 @@ do -- DistributedQueue
 	setmetatable(DistributedQueuePrototype, BaseQueueMetatable)
 
 	-- Atomically sets a server as a processor in the MemoryStore lock.
-	local function createProcessor(memoryStoreQueue: MemoryStoreSortedMap, serverId: string, instanceId: string)
-		local success, reason = retryAsync(memoryStoreQueue.SetAsync, memoryStoreQueue, serverId, true, SESSION_TIMEOUT)
+	local function createProcessor(memoryStoreQueue: MemoryStoreSortedMap, serverId: string, instanceId: string): (boolean, boolean)
+		local success, becameProcessor = retryAsync(memoryStoreQueue.UpdateAsync, memoryStoreQueue, serverId, function(value): boolean?
+			if value then
+				return nil
+			else
+				return true, os.time()
+			end
+		end, SESSION_TIMEOUT)
+
 		if not success then
-			logMessage(`[DistributedQueue][{instanceId}] Failed to create processor for server {serverId}: {reason}`, MINOR_ISSUE_SEVERITY)
-			return false
+			logMessage(
+				`[DistributedQueue][{instanceId}] Failed to create processor for server {serverId}: {becameProcessor}`,
+				MINOR_ISSUE_SEVERITY
+			)
+			return false, false
 		end
 
 		logMessage(`[DistributedQueue][{instanceId}] Server {serverId} is now a processor.`, INFO_SEVERITY)
-		return true
+		return true, becameProcessor
 	end
 
-	function DistributedQueuePrototype:IsMainServer()
+	local function getProcessorDistributionQueue(instanceId: string): MemoryStoreQueue
+		local memoryStoreQueue =
+			MemoryStoreService:GetQueue(MEMORY_STORE_PROCESSOR_DISTRIBUTION_QUEUE_FORMAT:format(instanceId), INVISIBILITY_TIMEOUT)
+		return memoryStoreQueue
+	end
+
+	local function distributeProcessors(
+		processorDistributionQueue: MemoryStoreQueue,
+		instanceId: string,
+		maxQueueProcessor: number,
+		memoryStoreLock: MemoryStoreSortedMap
+	)
+		local getSizeSuccess, processorCount = retryAsync(memoryStoreLock.GetSizeAsync, memoryStoreLock)
+		if not getSizeSuccess then
+			logMessage(`[DistributedQueue][{instanceId}] Failed to get processor count: {processorCount}`, MINOR_ISSUE_SEVERITY)
+			return false
+		end
+
+		logMessage(`[DistributedQueue][{instanceId}] Current processor count: {processorCount}`, INFO_SEVERITY)
+		if processorCount >= maxQueueProcessor then
+			logMessage(`[DistributedQueue][{instanceId}] Maximum processor limit reached ({maxQueueProcessor}).`, INFO_SEVERITY)
+			return true -- No need to add more processors.
+		end
+
+		local leftoverProcessors = maxQueueProcessor - processorCount
+		logMessage(`[DistributedQueue][{instanceId}] Attempting to add {leftoverProcessors} more processors.`, INFO_SEVERITY)
+
+		local processedProcessor = 0
+		local processingProcessor = 0
+
+		while processedProcessor < leftoverProcessors do
+			local readAmount = math.min(MAX_MEMORY_STORE_READ_COUNT, leftoverProcessors - processedProcessor)
+
+			local success, items: { any }?, id: string? =
+				retryAsync(processorDistributionQueue.ReadAsync, processorDistributionQueue, readAmount, false, 0)
+
+			if not success then
+				logMessage(
+					`[DistributedQueue][{instanceId}] Failed to read from processor distribution queue: {items}`,
+					MINOR_ISSUE_SEVERITY
+				)
+				return false -- Exit on read failure.
+			end
+
+			if not (items and id) then
+				logMessage(`[DistributedQueue][{instanceId}] No items read from processor distribution queue.`, INFO_SEVERITY)
+				return true -- Queue may be empty, no more processors to process.
+			end
+
+			local nItems = #items
+			if nItems == 0 then return true end -- Queue is empty.
+
+			processingProcessor += nItems
+
+			-- If read is successful, permanently remove the items to prevent reprocessing.
+			local removeSuccess, removeError: string? = retryAsync(processorDistributionQueue.RemoveAsync, processorDistributionQueue, id)
+			if not removeSuccess then
+				logMessage(
+					`[DistributedQueue][{instanceId}] Failed to remove items from queue after reading. Items may be processed again. Error: {removeError}`,
+					MINOR_ISSUE_SEVERITY
+				)
+				return false -- Exit on remove failure.
+			end
+
+			local mainThread = coroutine.running() -- Capture the main thread to resume later.
+
+			local function processItem(serverId: string)
+				local createProcessorSuccess, becameProcessor = createProcessor(memoryStoreLock, serverId, instanceId)
+				processingProcessor -= 1
+
+				if createProcessorSuccess then
+					if becameProcessor then
+						logMessage(`[DistributedQueue][{instanceId}] Successfully created processor for server {serverId}.`, INFO_SEVERITY)
+						retryAsync(MessagingService.PublishAsync, MessagingService, DISTRIBUTED_QUEUE_CHANGES_TOPIC, {
+							Event = "CreateProcessor",
+							ServerId = serverId,
+							InstanceId = instanceId,
+						})
+						processedProcessor += 1 -- Increment the count of successfully processed servers.
+					else
+						logMessage(`[DistributedQueue][{instanceId}] Server {serverId} is already a processor.`, IMPORTANT_INFO_SEVERITY)
+					end
+				else
+					logMessage(`[DistributedQueue][{instanceId}] Failed to create processor for server {serverId}.`, MINOR_ISSUE_SEVERITY)
+				end
+
+				if processingProcessor == 0 then
+					logMessage(`[DistributedQueue][{instanceId}] All processors processed. Resuming main thread.`, INFO_SEVERITY)
+					coroutine.resume(mainThread) -- Resume the main thread to continue processing.
+				end
+			end
+
+			for _, serverId in items do
+				task.spawn(processItem, serverId)
+			end
+
+			if processingProcessor > 0 then coroutine.yield() end
+
+			-- If we read fewer items than requested, it indicates the queue is now empty.
+			if nItems < readAmount then return true end
+		end
+
+		return true -- Successfully distributed processors.
+	end
+
+	local function createProcessorDistributionThread(instanceId: string, maxQueueProcessor: number, memoryStoreLock: MemoryStoreSortedMap)
+		local processorDistributionQueue = getProcessorDistributionQueue(instanceId)
+
+		while true do
+			task.wait(SESSION_REFRESH_INTERVAL)
+			distributeProcessors(processorDistributionQueue, instanceId, maxQueueProcessor, memoryStoreLock)
+		end
+	end
+
+	local function startProcessorDistributionThread(properties: BaseProperties & DistributedQueueProperties)
+		if properties[INDEX_DISTRIBUTION_THREAD] then return end -- Avoid starting multiple threads
+		if properties.MaxQueueProcessor == NO_LIMIT then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] No limit on queue processors. Distribution thread not started.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		-- Only the main server can start the distribution thread.
+		if properties[INDEX_SERVER_ROLE] ~= MAIN_SERVER then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] This server is not the main server. Cannot start distribution thread.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		logMessage(`[DistributedQueue][{properties.InstanceId}] Starting processor distribution thread.`, INFO_SEVERITY)
+		properties[INDEX_DISTRIBUTION_THREAD] = task.spawn(
+			createProcessorDistributionThread,
+			properties.InstanceId,
+			properties.MaxQueueProcessor,
+			properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
+		)
+	end
+
+	local function stopProcessorDistributionThread(properties: BaseProperties & DistributedQueueProperties)
+		local distributionThread = properties[INDEX_DISTRIBUTION_THREAD]
+		if distributionThread then
+			task.cancel(distributionThread)
+			properties[INDEX_DISTRIBUTION_THREAD] = nil
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Stopping processor distribution thread.`, INFO_SEVERITY)
+		end
+	end
+
+	local function becomeMainServer(properties: BaseProperties & DistributedQueueProperties): ()
+		local previousRole = properties[INDEX_SERVER_ROLE]
+		if previousRole == MAIN_SERVER then
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Already the main server.`, WARNING_SEVERITY, true)
+			return
+		end
+
+		if properties.MaxQueueProcessor == NO_LIMIT then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] No limit on queue processors. Cannot become main server.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		if not properties.CanBeMainServer then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] Cannot become main server. CanBeMainServer is false.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		properties[INDEX_SERVER_ROLE] = MAIN_SERVER
+		properties[INDEX_MAIN_SERVER_ID] = ServerId
+
+		if not properties.AutomateLifecycle then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] Lifecycle automation is disabled. Not starting update thread.`,
+				INFO_SEVERITY
+			)
+			return
+		end
+
+		if previousRole == NON_PROCESSOR_SERVER then startUpdateThread(properties) end
+		startProcessorDistributionThread(properties)
+	end
+
+	local function becomeProcessorServer(properties: BaseProperties & DistributedQueueProperties): ()
+		if properties[INDEX_SERVER_ROLE] ~= NON_PROCESSOR_SERVER then
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Already a processor server.`, WARNING_SEVERITY, true)
+			return
+		end
+
+		if not properties.CanBeProcessor then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] Cannot become processor server. CanBeProcessor is false.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		properties[INDEX_SERVER_ROLE] = PROCESSOR_SERVER
+		if properties.AutomateLifecycle then
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Lifecycle automation is enabled. Starting update thread.`, INFO_SEVERITY)
+			startUpdateThread(properties)
+		else
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Lifecycle automation is disabled. Not starting update thread.`, INFO_SEVERITY)
+		end
+	end
+
+	function DistributedQueuePrototype:UpdateProcessorDistribution()
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
-		return properties[INDEX_SERVER_ID] == MAIN_SERVER
+		if properties[INDEX_SERVER_ROLE] ~= MAIN_SERVER then
+			logMessage(
+				`[{self.ClassName}][{properties.InstanceId}] This server is not the main server. Cannot update distribution.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return false
+		end
+
+		return distributeProcessors(
+			getProcessorDistributionQueue(properties.InstanceId),
+			properties.InstanceId,
+			properties.MaxQueueProcessor,
+			properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
+		)
 	end
 
 	function DistributedQueuePrototype:IsActiveProcessor()
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
-		return properties[INDEX_SERVER_ID] ~= NON_PROCESSOR_SERVER
+		return (properties[INDEX_SERVER_ROLE] ~= NON_PROCESSOR_SERVER)
+	end
+
+	function DistributedQueuePrototype:GetActiveProcessorCount(): number?
+		local properties = getQueueProperties(self)
+		checkInit(properties[INDEX_INITIALIZED], 2)
+
+		logMessage(`[{self.ClassName}][{properties.InstanceId}] Getting active processor count...`, INFO_SEVERITY)
+
+		local memoryStoreLock = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
+		local success, count: any = retryAsync(memoryStoreLock.GetSizeAsync, memoryStoreLock)
+		if not success then
+			logMessage(`[{self.ClassName}][{properties.InstanceId}] Failed to get active processor count: {count}`, MINOR_ISSUE_SEVERITY)
+			return nil
+		end
+
+		return count
+	end
+
+	function DistributedQueuePrototype:GetActiveProcessorList(allOrNothing: boolean): { string }?
+		local properties = getQueueProperties(self)
+		checkInit(properties[INDEX_INITIALIZED], 2)
+
+		local memoryStoreLock = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
+
+		local items: { string } = {}
+		local nItems = 0
+		local exclusiveLowerBound = nil
+
+		local readCount = MAX_MEMORY_STORE_GET_RANGE_COUNT
+		readCount = readCount -- To prevent compiler from folding
+
+		while true do
+			local success, nextItems: any =
+				retryAsync(memoryStoreLock.GetRangeAsync, memoryStoreLock, Enum.SortDirection.Ascending, readCount, exclusiveLowerBound)
+
+			if not success then
+				logMessage(
+					`[{self.ClassName}][{properties.InstanceId}] Failed to get additional active processors: {nextItems}`,
+					MINOR_ISSUE_SEVERITY
+				)
+				return if allOrNothing then nil else items
+			end
+
+			local nNextItems = #nextItems
+			if nNextItems == 0 then break end -- No more items to process.
+			table.move(nextItems, 1, nNextItems, nItems + 1, items)
+
+			if nNextItems ~= readCount then break end -- No more items to process.
+			exclusiveLowerBound = nextItems[nNextItems]
+		end
+
+		return items
 	end
 
 	function DistributedQueuePrototype:SetMaxQueueProcessor(concurrency: number)
@@ -743,7 +1297,7 @@ do -- DistributedQueue
 		if properties[INDEX_INITIALIZED] then error("Cannot change MaxQueueProcessor after initialization.", 2) end
 
 		if type(concurrency) ~= "number" then error("Concurrency must be a number.", 2) end
-		if concurrency ~= -1 and concurrency < 1 then error("Invalid Concurrency. Must be -1 or >= 1.", 2) end
+		if concurrency ~= NO_LIMIT and concurrency < 1 then error("Invalid Concurrency. Must be -1 or >= 1.", 2) end
 
 		properties.MaxQueueProcessor = concurrency
 	end
@@ -752,23 +1306,27 @@ do -- DistributedQueue
 		local properties = getQueueProperties(self)
 		if type(canBeProcessor) ~= "boolean" then error("Can be processor must be a boolean.", 2) end
 		properties.CanBeProcessor = canBeProcessor
+		if not canBeProcessor then
+			properties.CanBeMainServer = false -- If a server cannot be a processor, it also cannot be the main server.
+		end
 
-		if not canBeProcessor and properties[INDEX_SERVER_ID] ~= NON_PROCESSOR_SERVER then
+		if not canBeProcessor and properties[INDEX_SERVER_ROLE] ~= NON_PROCESSOR_SERVER then
 			logMessage(`[{self.ClassName}][{self.InstanceId}] CanBeProcessor set to false. Releasing processor lock.`, INFO_SEVERITY)
 			self:ReleaseLock(true)
 		end
+	end
+
+	function DistributedQueuePrototype:SetProcessorCandidacyPriority(priority: number)
+		local properties = getQueueProperties(self)
+		if type(priority) ~= "number" then error("Processor candidacy priority must be a number.", 2) end
+		properties.ProcessorCandidacyPriority = priority
 	end
 
 	function DistributedQueuePrototype:ReleaseLock(immediateRelease: boolean?)
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
-		local currentServerType = properties[INDEX_SERVER_ID]
-
-		if properties.MaxQueueProcessor == -1 then
-			logMessage("[DistributedQueue] No limit on queue processors. Lock release is not applicable.", WARNING_SEVERITY, true)
-			return
-		end
+		local currentServerType = properties[INDEX_SERVER_ROLE]
 
 		if currentServerType == NON_PROCESSOR_SERVER then
 			logMessage("[DistributedQueue] This server is not an active processor. No lock to release.", WARNING_SEVERITY, true)
@@ -776,10 +1334,25 @@ do -- DistributedQueue
 		end
 
 		stopUpdateThread(properties)
-		properties[INDEX_SERVER_ID] = NON_PROCESSOR_SERVER
+		properties[INDEX_SERVER_ROLE] = NON_PROCESSOR_SERVER
+
+		if currentServerType == MAIN_SERVER then
+			stopProcessorDistributionThread(properties)
+			logMessage(`[{self.ClassName}][{self.InstanceId}] Releasing main server lock...`, INFO_SEVERITY)
+		else
+			logMessage(`[{self.ClassName}][{self.InstanceId}] Releasing processor lock...`, INFO_SEVERITY)
+		end
 
 		if immediateRelease == false then
-			logMessage(`[{self.ClassName}][{self.InstanceId}] Lock ownership lost locally. Waiting for session to expire in MemoryStore.`, INFO_SEVERITY)
+			logMessage(
+				`[{self.ClassName}][{self.InstanceId}] Lock ownership lost locally. Waiting for session to expire in MemoryStore.`,
+				INFO_SEVERITY
+			)
+			return
+		end
+
+		if properties.MaxQueueProcessor == NO_LIMIT then
+			logMessage("[DistributedQueue] No limit on queue processors. Lock release is not applicable.", INFO_SEVERITY)
 			return
 		end
 
@@ -802,7 +1375,10 @@ do -- DistributedQueue
 					PreviousServer = ServerId,
 				})
 			else
-				logMessage(`[{self.ClassName}][{instanceId}] Failed to remove main server lock from MemoryStore during release.`, MINOR_ISSUE_SEVERITY)
+				logMessage(
+					`[{self.ClassName}][{instanceId}] Failed to remove main server lock from MemoryStore during release.`,
+					MINOR_ISSUE_SEVERITY
+				)
 			end
 		else -- currentServerType == PROCESSOR_SERVER
 			logMessage(`[{self.ClassName}][{instanceId}] Releasing processor lock...`, INFO_SEVERITY)
@@ -812,14 +1388,71 @@ do -- DistributedQueue
 				logMessage(`[{self.ClassName}][{instanceId}] Processor lock released.`, INFO_SEVERITY)
 
 				-- Notify other servers via MessagingService that this server has released its processor role.
-				logMessage(`[{self.ClassName}][{instanceId}] Notifying other servers of processor slot availability., INFO_SEVERITY`)
+				logMessage(`[{self.ClassName}][{instanceId}] Notifying other servers of processor slot availability.`, INFO_SEVERITY)
 				retryAsync(MessagingService.PublishAsync, MessagingService, DISTRIBUTED_QUEUE_CHANGES_TOPIC, {
 					Event = "ProcessorReleased",
 					ServerId = ServerId,
 					InstanceId = instanceId,
 				})
 			else
-				logMessage(`[{self.ClassName}][{instanceId}] Failed to remove processor lock from MemoryStore during release.`, MINOR_ISSUE_SEVERITY)
+				logMessage(
+					`[{self.ClassName}][{instanceId}] Failed to remove processor lock from MemoryStore during release.`,
+					MINOR_ISSUE_SEVERITY
+				)
+			end
+		end
+	end
+
+	function DistributedQueuePrototype:SetLifecycleAutomation(automateLifecycle: boolean)
+		local properties = getQueueProperties(self)
+		if type(automateLifecycle) ~= "boolean" then error("Automate lifecycle must be a boolean.", 2) end
+
+		local previousLifecycleAutomation = properties.AutomateLifecycle
+		if automateLifecycle == previousLifecycleAutomation then
+			logMessage(
+				`[DistributedQueue][{properties.InstanceId}] Lifecycle automation already set to {automateLifecycle}.`,
+				INFO_SEVERITY
+			)
+			return
+		end
+
+		properties.AutomateLifecycle = automateLifecycle
+
+		if automateLifecycle then
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Lifecycle automation enabled.`, INFO_SEVERITY)
+			if properties[INDEX_SERVER_ROLE] == PROCESSOR_SERVER then
+				logMessage(`[DistributedQueue][{properties.InstanceId}] This server is a processor. Starting update thread.`, INFO_SEVERITY)
+				startUpdateThread(properties)
+			end
+			if properties[INDEX_SERVER_ROLE] == MAIN_SERVER then
+				logMessage(
+					`[DistributedQueue][{properties.InstanceId}] This server is the main server. Starting distribution thread.`,
+					INFO_SEVERITY
+				)
+				startProcessorDistributionThread(properties)
+			end
+			local index = table.find(ActiveSessionQueues, self)
+			if not index then
+				logMessage(`[DistributedQueue][{properties.InstanceId}] Adding queue to active session queues.`, INFO_SEVERITY)
+				table.insert(ActiveSessionQueues, self)
+			end
+		else
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Lifecycle automation disabled.`, INFO_SEVERITY)
+			if properties[INDEX_SERVER_ROLE] == PROCESSOR_SERVER then
+				logMessage(`[DistributedQueue][{properties.InstanceId}] This server is a processor. Stopping update thread.`, INFO_SEVERITY)
+				stopUpdateThread(properties)
+			end
+			if properties[INDEX_SERVER_ROLE] == MAIN_SERVER then
+				logMessage(
+					`[DistributedQueue][{properties.InstanceId}] This server is the main server. Stopping distribution thread.`,
+					INFO_SEVERITY
+				)
+				stopProcessorDistributionThread(properties)
+			end
+			local index = table.find(ActiveSessionQueues, self)
+			if index then
+				logMessage(`[DistributedQueue][{properties.InstanceId}] Removing queue from active session queues.`, INFO_SEVERITY)
+				table.remove(ActiveSessionQueues, index)
 			end
 		end
 	end
@@ -828,78 +1461,233 @@ do -- DistributedQueue
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
+		if properties[INDEX_UPDATE_FLAG] then
+			logMessage(`[DistributedQueue][{properties.InstanceId}] Session is being updated.`, INFO_SEVERITY)
+			return true -- Session is being updated
+		end
+
+		logMessage(`[DistributedQueue][{properties.InstanceId}] Updating session...`, INFO_SEVERITY)
+		properties[INDEX_UPDATE_FLAG] = coroutine.running() -- Set the flag to prevent re-entrancy.
+
 		local memoryStore = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
-		local serverLevel = properties[INDEX_SERVER_ID]
+		local serverLevel = properties[INDEX_SERVER_ROLE]
 		local instanceId = properties.InstanceId
 
 		local maxQueueProcessor = properties.MaxQueueProcessor
-		if maxQueueProcessor == -1 then
+		if maxQueueProcessor == NO_LIMIT then
 			-- No limit on the number of servers processing this queue. This server will always process.
+			logMessage(
+				`[DistributedQueue][{instanceId}] No limit on queue processors. This server will always process.`,
+				WARNING_SEVERITY,
+				true
+			)
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 			return true
 		end
 
+		local releaseLock = false
+
 		if serverLevel == MAIN_SERVER then
+			if not properties.CanBeMainServer then
+				logMessage(`[DistributedQueue][{instanceId}] This server cannot be the main server. Releasing lock.`, INFO_SEVERITY)
+				self:ReleaseLock(true) -- Relinquish role if it cannot be main server.
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+
 			-- This server is the main server. Attempt to refresh the lock.
 			local success, updateResult = retryAsync(memoryStore.UpdateAsync, memoryStore, "MainServer", function(value): string?
+				if not properties.CanBeMainServer then
+					releaseLock = true
+					return nil -- Abort update, this server cannot be main.
+				end
+
 				if not value or value == ServerId then return ServerId end
 				return nil -- Abort update, another server took the lock.
 			end, SESSION_TIMEOUT)
 
-			if success and updateResult then return true end -- Refresh successful.
+			if releaseLock then
+				logMessage(`[DistributedQueue][{instanceId}] This server cannot be the main server. Releasing lock.`, INFO_SEVERITY)
+				self:ReleaseLock(true) -- Relinquish role if it cannot be main server.
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+
+			-- Refresh successful.
+			if success and updateResult then
+				logMessage(`[DistributedQueue][{instanceId}] Successfully refreshed main server lock.`, INFO_SEVERITY)
+
+				if not properties.CanBeMainServer then
+					logMessage(`[DistributedQueue][{instanceId}] This server is not eligible to be the main server.`, INFO_SEVERITY)
+					self:ReleaseLock(true) -- If this server cannot be main, release the lock.
+				end
+
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
 
 			logMessage(`[DistributedQueue][{instanceId}] Failed to refresh main server lock. Relinquishing role.`, IMPORTANT_INFO_SEVERITY)
 			-- If the atomic update fails, this server must assume it has lost the lock.
 			self:ReleaseLock(false)
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 			return false
-		elseif serverLevel == PROCESSOR_SERVER then
+		end
+
+		if properties.CanBeMainServer then
+			-- Check on the main server, is it still active?
+			local success, mainServerId = retryAsync(memoryStore.UpdateAsync, memoryStore, "MainServer", function(value): string?
+				if not properties.CanBeMainServer then
+					logMessage(`[DistributedQueue][{instanceId}] This server cannot be the main server.`, INFO_SEVERITY)
+					return nil -- Abort update, this server cannot be main.
+				end
+
+				if not value or value == ServerId then return ServerId end
+				return nil -- Abort update, another server held the lock.
+			end, SESSION_TIMEOUT)
+
+			if not success then
+				logMessage(`[DistributedQueue][{instanceId}] Failed to check main server status.`, MINOR_ISSUE_SEVERITY)
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return false
+			end
+
+			if mainServerId then
+				logMessage(`[DistributedQueue][{instanceId}] Successfully became the main processor.`, IMPORTANT_INFO_SEVERITY)
+				if not properties.CanBeMainServer then
+					logMessage(`[DistributedQueue][{instanceId}] This server cannot be a processor. Releasing lock.`, INFO_SEVERITY)
+					properties[INDEX_SERVER_ROLE] = MAIN_SERVER
+					self:ReleaseLock(true) -- Relinquish role if it cannot be a processor.
+					properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+					return true
+				end
+
+				becomeMainServer(properties)
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+		end
+
+		if serverLevel == PROCESSOR_SERVER then
+			if not properties.CanBeProcessor then
+				logMessage(`[DistributedQueue][{instanceId}] This server cannot be a processor. Releasing lock.`, WARNING_SEVERITY)
+				self:ReleaseLock(true) -- Relinquish role if it cannot be a processor.
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+
 			-- This server is a regular processor. Attempt to refresh the lock.
 			local success, updateResult = retryAsync(memoryStore.UpdateAsync, memoryStore, ServerId, function(value): boolean?
+				if not properties.CanBeProcessor then
+					releaseLock = true
+					return nil -- Abort update, this server cannot be a processor.
+				end
+
 				if value then return true end -- Lock exists, refresh it.
 				return nil -- Lock expired, abort refresh.
 			end, SESSION_TIMEOUT)
 
-			if success and updateResult then return true end -- Refresh successful.
+			if releaseLock then
+				logMessage(`[DistributedQueue][{instanceId}] This server cannot be a processor. Releasing lock.`, INFO_SEVERITY)
+				self:ReleaseLock(true) -- Relinquish role if it cannot be a processor.
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
 
-			logMessage(`[DistributedQueue][{instanceId}] Session expired or failed to refresh. This server is no longer a processor.`, IMPORTANT_INFO_SEVERITY)
+			if success and updateResult then
+				logMessage(`[DistributedQueue][{instanceId}] Successfully refreshed processor lock.`, INFO_SEVERITY)
+
+				if not properties.CanBeProcessor then
+					logMessage(`[DistributedQueue][{instanceId}] This server is not eligible to be a processor.`, INFO_SEVERITY)
+					self:ReleaseLock(true) -- If this server cannot be a processor, release the lock.
+				end
+
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+
+			logMessage(
+				`[DistributedQueue][{instanceId}] Session expired or failed to refresh. This server is no longer a processor.`,
+				IMPORTANT_INFO_SEVERITY
+			)
 			self:ReleaseLock(success) -- If refresh failed due to network, don't publish release.
+
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 			return false
 		elseif serverLevel == NON_PROCESSOR_SERVER then
 			-- This server is not a processor. Check if it can become one.
-			if not properties.CanBeProcessor then return true end -- Not eligible to be a processor.
+			if not properties.CanBeProcessor then
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end -- Not eligible to be a processor.
 
 			local getSizeSuccess, currentProcessorsAmount = retryAsync(memoryStore.GetSizeAsync, memoryStore)
 			if not getSizeSuccess then
 				logMessage(`[DistributedQueue][{instanceId}] Failed to get current processor count.`, MINOR_ISSUE_SEVERITY)
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 				return false
 			end
 
 			-- If there are no active processors, attempt to become the main processor.
-			if currentProcessorsAmount == 0 then
+			if currentProcessorsAmount == 0 and properties.CanBeMainServer then
 				logMessage(`[DistributedQueue][{instanceId}] No active processors. Attempting to become main processor.`, INFO_SEVERITY)
 				local success, updateResult = retryAsync(memoryStore.UpdateAsync, memoryStore, "MainServer", function(value): string?
+					if not properties.CanBeMainServer then
+						logMessage(`[DistributedQueue][{instanceId}] This server cannot be the main server.`, INFO_SEVERITY)
+						return nil -- Abort update, this server cannot be main.
+					end
 					if not value then return ServerId end -- No main server, claim it.
 					return nil -- Another server claimed it first.
 				end, SESSION_TIMEOUT)
 
-				if success and updateResult then
+				if not success then
+					logMessage(`[DistributedQueue][{instanceId}] Failed to become main processor: {updateResult}`, MINOR_ISSUE_SEVERITY)
+					properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+					return false
+				end
+
+				if updateResult then
 					logMessage(`[DistributedQueue][{instanceId}] Successfully became the main processor.`, IMPORTANT_INFO_SEVERITY)
-					properties[INDEX_SERVER_ID] = MAIN_SERVER
-					createUpdateThread(properties)
+
+					if not properties.CanBeMainServer then
+						logMessage(`[DistributedQueue][{instanceId}] This server cannot be a processor. Releasing lock.`, INFO_SEVERITY)
+						properties[INDEX_SERVER_ROLE] = MAIN_SERVER
+						self:ReleaseLock(true) -- Relinquish role if it cannot be a processor.
+						properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+						return true
+					end
+
+					becomeMainServer(properties)
+					properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 					return true
+				else
+					logMessage(`[DistributedQueue][{instanceId}] Another server is already the main processor.`, INFO_SEVERITY)
 				end
 			end
 
 			-- If capacity is full, do nothing.
-			if currentProcessorsAmount >= maxQueueProcessor then return true end
+			if currentProcessorsAmount >= maxQueueProcessor then
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
 
 			-- Request to become a processor.
 			logMessage(`[DistributedQueue][{instanceId}] Requesting to become a processor...`, INFO_SEVERITY)
-			retryAsync(MessagingService.PublishAsync, MessagingService, DISTRIBUTED_QUEUE_CHANGES_TOPIC, {
-				Event = "ProcessorRequest",
-				InstanceId = instanceId,
-				ServerId = ServerId,
-			})
+			local processorDistributionQueue = getProcessorDistributionQueue(instanceId)
+
+			local success, errorMsg: string? = retryAsync(
+				processorDistributionQueue.AddAsync,
+				processorDistributionQueue,
+				ServerId,
+				SESSION_REFRESH_INTERVAL,
+				properties.ProcessorCandidacyPriority
+			)
+			if not success then
+				logMessage(`[DistributedQueue][{instanceId}] Failed to request processor role: {errorMsg}`, MINOR_ISSUE_SEVERITY)
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return false
+			end
 		end
+		properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 		return true
 	end
 
@@ -912,105 +1700,93 @@ do -- DistributedQueue
 		logMessage(`[DistributedQueue][{properties.InstanceId}] Initializing.`, INFO_SEVERITY)
 		properties[INDEX_INITIALIZED] = true
 
-		if properties.MaxQueueProcessor == -1 then
+		if properties.MaxQueueProcessor == NO_LIMIT then
 			-- No limit on processors. Every server can process.
-			logMessage(`[DistributedQueue][{properties.InstanceId}] MaxQueueProcessor is -1. This server will process the queue.`, INFO_SEVERITY)
-			properties[INDEX_SERVER_ID] = PROCESSOR_SERVER -- Mark as a processor, though no lock is held.
-			createUpdateThread(properties)
+			if properties.CanBeProcessor then
+				logMessage(
+					`[DistributedQueue][{properties.InstanceId}] No limit on queue processors. This server will process items.`,
+					INFO_SEVERITY
+				)
+				becomeProcessorServer(properties)
+			else
+				logMessage(
+					`[DistributedQueue][{properties.InstanceId}] No limit on queue processors. This server will not process items, as it cannot be processor.`,
+					INFO_SEVERITY
+				)
+			end
 			return true
 		end
 
-		local memoryStore = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreSortedMap
-
 		local instanceId = properties.InstanceId
-		local processorCount: number
 
 		-- Subscribe to messages for faster state changes.
-		retryAsync(MessagingService.SubscribeAsync, MessagingService, DISTRIBUTED_QUEUE_CHANGES_TOPIC, function(message)
-			local messageData = message.Data
-			if messageData.InstanceId ~= instanceId then return end -- Ignore messages for other instances.
+		local success, subscription = retryAsync(
+			MessagingService.SubscribeAsync,
+			MessagingService,
+			DISTRIBUTED_QUEUE_CHANGES_TOPIC,
+			function(message)
+				local messageData = message.Data
+				if messageData.InstanceId ~= instanceId then return end -- Ignore messages for other instances.
 
-			if messageData.Event == "ProcessorReleased" or messageData.Event == "MainServerReleased" then
-				if not properties.CanBeProcessor or self:IsActiveProcessor() then return end
-				-- A slot has opened up. Try to take it.
-				logMessage(`[DistributedQueue][{instanceId}] Received release message. Checking for available processor slots.`, INFO_SEVERITY)
-				self:UpdateSession()
-			elseif messageData.Event == "CreateProcessor" then
-				if messageData.ServerId ~= ServerId then return end
-				-- This server's request was approved by the main server.
-				logMessage(`[DistributedQueue][{instanceId}] Processor request approved. This server is now a processor.`, IMPORTANT_INFO_SEVERITY)
-				properties[INDEX_SERVER_ID] = PROCESSOR_SERVER
-				createUpdateThread(properties)
-			elseif messageData.Event == "ProcessorRequest" then
-				-- Another server is requesting to become a processor. Only the main server can act on this.
-				if not self:IsMainServer() then return end
-
-				-- This block ensures processorCount is initialized atomically and serves as a source of truth.
-				-- As the main server is the only one creating processors, this count is reliable.
-				if not processorCount then
-					logMessage(`[DistributedQueue][{instanceId}] Main server is initializing local processor count...`, INFO_SEVERITY)
-					local getSizeSuccess, currentCount = retryAsync(memoryStore.GetSizeAsync, memoryStore)
-					if not getSizeSuccess then
-						logMessage(`[DistributedQueue][{instanceId}] Failed to get current processor count to handle request.`, MINOR_ISSUE_SEVERITY)
-						return
-					end
-					processorCount = currentCount
-					logMessage(`[DistributedQueue][{instanceId}] Local processor count initialized to {processorCount}.`, INFO_SEVERITY)
-				end
-
-				if processorCount >= properties.MaxQueueProcessor then
-					logMessage(`[DistributedQueue][{instanceId}] Processor request denied for {messageData.ServerId}. At capacity.`, WARNING_SEVERITY)
-					return
-				end
-
-				-- Reserve a slot and approve the request.
-				processorCount = processorCount + 1
-				logMessage(
-					`[DistributedQueue][{instanceId}] Approving processor request for {messageData.ServerId}. New count: {processorCount}`,
-					INFO_SEVERITY
-				)
-
-				local targetServerId = messageData.ServerId
-				local createProcessorSuccess = createProcessor(memoryStore, targetServerId, instanceId)
-
-				if createProcessorSuccess then
-					retryAsync(MessagingService.PublishAsync, MessagingService, DISTRIBUTED_QUEUE_CHANGES_TOPIC, {
-						Event = "CreateProcessor",
-						ServerId = targetServerId,
-						InstanceId = instanceId,
-					})
-				else
-					-- If creating the processor fails, decrement the count.
-					processorCount = processorCount - 1
+				if messageData.Event == "ProcessorReleased" or messageData.Event == "MainServerReleased" then
+					if not properties.CanBeProcessor or self:IsActiveProcessor() then return end
+					-- A slot has opened up. Try to take it.
 					logMessage(
-						`[DistributedQueue][{instanceId}] Failed to create processor for {targetServerId}. Reverting count to {processorCount}.`,
-						MINOR_ISSUE_SEVERITY
+						`[DistributedQueue][{instanceId}] Received release message. Checking for available processor slots.`,
+						INFO_SEVERITY
 					)
+					self:UpdateSession()
+				elseif messageData.Event == "CreateProcessor" then
+					if messageData.ServerId ~= ServerId then return end
+					-- This server's request was approved by the main server.
+					logMessage(
+						`[DistributedQueue][{instanceId}] Processor request approved. This server is now a processor.`,
+						IMPORTANT_INFO_SEVERITY
+					)
+					becomeProcessorServer(properties)
 				end
 			end
-		end)
+		)
 
-		-- Immediately try to become a processor on initialization.
-		self:UpdateSession()
-		-- Start a persistent thread to periodically refresh the session lock.
-		table.insert(ActiveSessionQueues, self)
+		if not success then
+			logMessage(
+				`[DistributedQueue][{instanceId}] Failed to subscribe to DistributedQueue changes: {subscription}`,
+				IMPORTANT_INFO_SEVERITY
+			)
+			properties[INDEX_INITIALIZED] = false -- Reset initialization state.
+			return false
+		end
+
+		properties[INDEX_SUBSCRIPTION] = subscription -- Store the subscription for later cleanup.
+
+		if properties.AutomateLifecycle then
+			logMessage(`[CentralizedQueue][{instanceId}] Lifecycle automation is enabled. Starting session update.`, INFO_SEVERITY)
+			-- Immediately try to become the main server on initialization.
+			task.spawn(self.UpdateSession, self)
+			-- Start a persistent thread to periodically refresh the session lock.
+			table.insert(ActiveSessionQueues, self)
+		end
 
 		logMessage(`[DistributedQueue][{instanceId}] Initialized successfully.`, INFO_SEVERITY)
 		return true
 	end
 
 	Constructor.CreateDistributedQueue = function<T>(instanceId: string?): DistributedQueue<T>
-		local proxy, id, properties = createBaseQueue(instanceId, "DistributedQueue")
+		local proxy, properties = createBaseQueue(instanceId, "DistributedQueue")
 		if not properties then return proxy :: DistributedQueue<T> end
+
+		local id = properties.InstanceId
 
 		properties[INDEX_PROTOTYPE] = DistributedQueuePrototype
 		properties[INDEX_CALLBACKS] = {} :: Callbacks<T>
-		properties[INDEX_MEMORY_STORE_LOCK] = MemoryStoreService:GetSortedMap(`DISTRIBUTED_QUEUE_{UNIQUE_KEY}_Lock_{id}`)
-		properties[INDEX_MEMORY_STORE_QUEUE] = MemoryStoreService:GetQueue(`DISTRIBUTED_QUEUE_{UNIQUE_KEY}_QUEUE_{id}`)
-		properties[INDEX_SERVER_ID] = NON_PROCESSOR_SERVER -- Start as a non-processor
+		properties[INDEX_MEMORY_STORE_LOCK] = MemoryStoreService:GetSortedMap(MEMORY_STORE_LOCK_FORMAT:format(properties.ClassName, id))
+		properties[INDEX_MEMORY_STORE_QUEUE] =
+			MemoryStoreService:GetQueue(MEMORY_STORE_QUEUE_FORMAT:format(properties.ClassName, id), INVISIBILITY_TIMEOUT)
+		properties[INDEX_SERVER_ROLE] = NON_PROCESSOR_SERVER -- Start as a non-processor
 
 		properties.MaxQueueProcessor = DEFAULT_MAX_QUEUE_PROCESSOR
 		properties.CanBeProcessor = DEFAULT_CAN_BE_PROCESSOR
+		properties.ProcessorCandidacyPriority = DEFAULT_PROCESSOR_CANDIDACY_PRIORITY
 
 		return proxy :: DistributedQueue<T>
 	end
@@ -1018,7 +1794,7 @@ end
 
 do -- CentralizedQueue
 	--[[
-		A CentralizedQueue is a queue where a single "main" server is elected to process all items. 
+		A CentralizedQueue is a queue where a single "main" server is elected to process all items.
 		This is useful for tasks that must not be run in parallel. Other servers can add items
 		to this queue, but only the elected main server will read and process them.
 	]]
@@ -1026,39 +1802,66 @@ do -- CentralizedQueue
 	local CentralizedQueuePrototype = {} :: CentralizedQueue<any>
 	setmetatable(CentralizedQueuePrototype, BaseQueueMetatable)
 
-	function CentralizedQueuePrototype:GetMainServerId(): string?
-		local properties = getQueueProperties(self)
-		checkInit(properties[INDEX_INITIALIZED], 2)
-		return properties[INDEX_SERVER_ID]
-	end
+	local function becomeMainServer(properties: BaseProperties): ()
+		if properties[INDEX_SERVER_ROLE] == MAIN_SERVER then
+			logMessage(`[CentralizedQueue][{properties.InstanceId}] Already the main server.`, WARNING_SEVERITY, true)
+			return
+		end
 
-	function CentralizedQueuePrototype:IsMainServer(): boolean
-		local properties = getQueueProperties(self)
-		checkInit(properties[INDEX_INITIALIZED], 2)
-		return properties[INDEX_SERVER_ID] == ServerId
+		if not properties.CanBeMainServer then
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Cannot become main server. CanBeMainServer is false.`,
+				WARNING_SEVERITY,
+				true
+			)
+			return
+		end
+
+		properties[INDEX_SERVER_ROLE] = MAIN_SERVER
+		properties[INDEX_MAIN_SERVER_ID] = ServerId -- Mark this server as the main server.
+		if properties.AutomateLifecycle then
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Lifecycle automation is enabled. Starting update thread.`,
+				INFO_SEVERITY
+			)
+			startUpdateThread(properties)
+		else
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Lifecycle automation is disabled. Not starting update thread.`,
+				INFO_SEVERITY
+			)
+		end
 	end
 
 	function CentralizedQueuePrototype:ReleaseLock(immediateRelease: boolean?)
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
-		if properties[INDEX_SERVER_ID] ~= ServerId then
-			logMessage(`[CentralizedQueue][{properties.InstanceId}] Attempted to release lock, but this is not the main server.`, WARNING_SEVERITY, true)
+		if properties[INDEX_SERVER_ROLE] ~= MAIN_SERVER then
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Attempted to release lock, but this is not the main server.`,
+				WARNING_SEVERITY,
+				true
+			)
 			return
 		end
 
 		stopUpdateThread(properties)
-		properties[INDEX_SERVER_ID] = nil
+		properties[INDEX_SERVER_ROLE] = NON_PROCESSOR_SERVER -- Reset server role to non-processor
+		properties[INDEX_MAIN_SERVER_ID] = nil
 
 		if immediateRelease == false then
-			logMessage(`[CentralizedQueue][{properties.InstanceId}] Lock ownership lost locally. Waiting for session to expire in MemoryStore.`, INFO_SEVERITY)
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Lock ownership lost locally. Waiting for session to expire in MemoryStore.`,
+				INFO_SEVERITY
+			)
 			return
 		end
 
 		logMessage(`[CentralizedQueue][{properties.InstanceId}] Releasing main server lock...`, INFO_SEVERITY)
 		local memoryStore = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreHashMap
 		local instanceId = properties.InstanceId
-		local success, err = retryAsync(memoryStore.RemoveAsync, memoryStore, "MainServer")
+		local success, errorMsg: string? = retryAsync(memoryStore.RemoveAsync, memoryStore, "MainServer")
 		if success then
 			logMessage(`[CentralizedQueue][{instanceId}] Main server lock released.`, INFO_SEVERITY)
 
@@ -1070,7 +1873,10 @@ do -- CentralizedQueue
 				PreviousServer = ServerId,
 			})
 		else
-			logMessage(`[CentralizedQueue][{instanceId}] Failed to remove main server lock from MemoryStore during release: {err}`, MINOR_ISSUE_SEVERITY)
+			logMessage(
+				`[CentralizedQueue][{instanceId}] Failed to remove main server lock from MemoryStore during release: {errorMsg}`,
+				MINOR_ISSUE_SEVERITY
+			)
 		end
 	end
 
@@ -1080,45 +1886,116 @@ do -- CentralizedQueue
 		local properties = getQueueProperties(self)
 		checkInit(properties[INDEX_INITIALIZED], 2)
 
+		if properties[INDEX_UPDATE_FLAG] then
+			logMessage(`[CentralizedQueue][{properties.InstanceId}] Session is being updated.`, INFO_SEVERITY)
+			return true -- Session is being updated
+		end
+
+		properties[INDEX_UPDATE_FLAG] = coroutine.running() -- Set the flag to prevent re-entrancy.
+
 		local memoryStore = properties[INDEX_MEMORY_STORE_LOCK] :: MemoryStoreHashMap
 		local instanceId = properties.InstanceId
-		if not properties.CanBeMainServer then return true end -- Not eligible to be main server.
+
+		if not properties.CanBeMainServer then -- Not eligible to be main server.
+			logMessage(`[CentralizedQueue][{instanceId}] This server cannot be the main server.`, INFO_SEVERITY)
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+			return true
+		end
 
 		local currentMainServerId: string
-
-		-- UpdateAsync provides an atomic way to read and write the "MainServer" key.
-		local success, reason = retryAsync(memoryStore.UpdateAsync, memoryStore, "MainServer", function(value): string?
-			-- If no server is main, or if this server is already main, claim/refresh the lock.
-			if not value or value == ServerId then
-				currentMainServerId = ServerId
-				return ServerId
-			end
-			-- Otherwise, another server holds the lock. Do not change it.
-			currentMainServerId = value
-			return nil -- Abort the update operation.
-		end, SESSION_TIMEOUT)
+		local releaseLock = false
 
 		local wasMainServer = self:IsMainServer()
 
+		-- UpdateAsync provides an atomic way to read and write the "MainServer" key.
+		local success, errorMsg = retryAsync(memoryStore.UpdateAsync, memoryStore, "MainServer", function(value): string?
+			currentMainServerId = value or ServerId
+
+			if not properties.CanBeMainServer then
+				releaseLock = true
+				return nil -- Abort update, this server cannot be main.
+			end
+
+			-- If no server is main, or if this server is already main, claim/refresh the lock.
+			if not value or value == ServerId then return ServerId end
+
+			-- Otherwise, another server holds the lock. Do not change it.
+			return nil -- Abort the update operation.
+		end, SESSION_TIMEOUT)
+
+		if wasMainServer and releaseLock then
+			logMessage(`[CentralizedQueue][{instanceId}] This server cannot be the main server. Releasing lock.`, INFO_SEVERITY)
+			-- Relinquish role if it cannot be main server.
+			-- Publish a message only if the lock wasn't held by other server.
+			self:ReleaseLock(currentMainServerId == ServerId)
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+			return true
+		end
+
 		if not success then
-			logMessage(`[CentralizedQueue][{instanceId}] Failed to update session lock: {reason}`, MINOR_ISSUE_SEVERITY)
+			logMessage(`[CentralizedQueue][{instanceId}] Failed to update session lock: {errorMsg}`, MINOR_ISSUE_SEVERITY)
 			if wasMainServer then self:ReleaseLock(false) end
+			properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 			return false
 		end
 
 		-- Update local state based on the outcome.
-		properties[INDEX_SERVER_ID] = currentMainServerId
-		local isMainServer = self:IsMainServer()
+		local isMainServer = currentMainServerId == ServerId
 
 		if isMainServer and not wasMainServer then
 			logMessage(`[CentralizedQueue][{instanceId}] This server has become the main server.`, IMPORTANT_INFO_SEVERITY)
-			createUpdateThread(properties)
-		elseif not isMainServer and wasMainServer then
-			logMessage(`[CentralizedQueue][{instanceId}] This server has lost its main server status.`, IMPORTANT_INFO_SEVERITY)
-			stopUpdateThread(properties)
+
+			if not properties.CanBeMainServer then
+				logMessage(`[CentralizedQueue][{instanceId}] This server cannot be the main server. Releasing lock.`, INFO_SEVERITY)
+				properties[INDEX_SERVER_ROLE] = MAIN_SERVER -- Mark this server as the main server.
+				self:ReleaseLock(true) -- Relinquish role if it cannot be main server.
+				properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
+				return true
+			end
+
+			becomeMainServer(properties)
+		elseif not isMainServer then
+			if wasMainServer then
+				logMessage(`[CentralizedQueue][{instanceId}] This server has lost its main server status.`, IMPORTANT_INFO_SEVERITY)
+				self:ReleaseLock(false)
+			else
+				properties[INDEX_MAIN_SERVER_ID] = currentMainServerId
+			end
 		end
 
+		properties[INDEX_UPDATE_FLAG] = false -- Reset the update flag.
 		return true
+	end
+
+	function CentralizedQueuePrototype:SetLifecycleAutomation(automateLifecycle: boolean)
+		local properties = getQueueProperties(self)
+		if type(automateLifecycle) ~= "boolean" then error("AutomateLifecycle must be a boolean.", 2) end
+
+		local previousLifecycleAutomation = properties.AutomateLifecycle
+		if automateLifecycle == previousLifecycleAutomation then
+			logMessage(
+				`[CentralizedQueue][{properties.InstanceId}] Lifecycle automation already set to {automateLifecycle}.`,
+				INFO_SEVERITY
+			)
+			return
+		end
+
+		properties.AutomateLifecycle = automateLifecycle
+		if automateLifecycle then
+			logMessage(`[CentralizedQueue][{properties.InstanceId}] Lifecycle automation enabled.`, INFO_SEVERITY)
+			if properties[INDEX_SERVER_ROLE] == MAIN_SERVER then startUpdateThread(properties) end
+			local index = table.find(ActiveSessionQueues, self)
+			if not index then
+				table.insert(ActiveSessionQueues, self) -- Add to active session queues if not already present.
+			end
+		else
+			logMessage(`[CentralizedQueue][{properties.InstanceId}] Lifecycle automation disabled.`, INFO_SEVERITY)
+			if properties[INDEX_SERVER_ROLE] == MAIN_SERVER then stopUpdateThread(properties) end
+			local index = table.find(ActiveSessionQueues, self)
+			if index then
+				table.remove(ActiveSessionQueues, index) -- Remove from active session queues.
+			end
+		end
 	end
 
 	function CentralizedQueuePrototype:Init()
@@ -1133,33 +2010,59 @@ do -- CentralizedQueue
 		local instanceId = properties.InstanceId
 		-- Subscribe to messages indicating the main server lock has been released.
 		-- This allows for a faster takeover than waiting for the session lock to expire.
-		retryAsync(MessagingService.SubscribeAsync, MessagingService, CENTRALIZED_QUEUE_CHANGES_TOPIC, function(message)
-			local messageData = message.Data
-			if messageData.InstanceId ~= instanceId then return end
-			if messageData.Event == "MainServerReleased" then
-				if messageData.PreviousServer == ServerId then return end
-				logMessage(`[CentralizedQueue][{instanceId}] Received release message. Attempting to become main server.`, INFO_SEVERITY)
-				self:UpdateSession()
+		local success, subscription = retryAsync(
+			MessagingService.SubscribeAsync,
+			MessagingService,
+			CENTRALIZED_QUEUE_CHANGES_TOPIC,
+			function(message)
+				local messageData = message.Data
+				if messageData.InstanceId ~= instanceId then return end
+				if messageData.Event == "MainServerReleased" then
+					if messageData.PreviousServer == ServerId then return end
+					logMessage(
+						`[CentralizedQueue][{instanceId}] Received release message. Attempting to become main server.`,
+						INFO_SEVERITY
+					)
+					self:UpdateSession()
+				end
 			end
-		end)
+		)
 
-		-- On initialization, immediately try to become the main server.
-		self:UpdateSession()
-		-- Start a persistent thread to periodically refresh the session lock.
-		table.insert(ActiveSessionQueues, self)
+		if not success then
+			logMessage(
+				`[CentralizedQueue][{instanceId}] Failed to subscribe to CentralizedQueue changes: {subscription}`,
+				IMPORTANT_INFO_SEVERITY
+			)
+			properties[INDEX_INITIALIZED] = false
+			return false
+		end
+
+		properties[INDEX_SUBSCRIPTION] = subscription -- Store the subscription for later cleanup.
+
+		if properties.AutomateLifecycle then
+			logMessage(`[CentralizedQueue][{instanceId}] Lifecycle automation is enabled. Starting session update.`, INFO_SEVERITY)
+			-- Immediately try to become the main server on initialization.
+			task.spawn(self.UpdateSession, self)
+			-- Start a persistent thread to periodically refresh the session lock.
+			table.insert(ActiveSessionQueues, self)
+		end
 
 		logMessage(`[CentralizedQueue][{instanceId}] Initialized successfully.`, INFO_SEVERITY)
 		return true
 	end
 
 	Constructor.CreateCentralizedQueue = function<T>(instanceId: string?): CentralizedQueue<T>
-		local proxy, id, properties = createBaseQueue(instanceId, "CentralizedQueue")
+		local proxy, properties = createBaseQueue(instanceId, "CentralizedQueue")
 		if not properties then return proxy :: CentralizedQueue<T> end
+
+		local id = properties.InstanceId
 
 		properties[INDEX_PROTOTYPE] = CentralizedQueuePrototype
 		properties[INDEX_CALLBACKS] = {} :: Callbacks<T>
-		properties[INDEX_MEMORY_STORE_LOCK] = MemoryStoreService:GetHashMap(`CENTRALIZED_QUEUE_{UNIQUE_KEY}_Lock_{id}`)
-		properties[INDEX_MEMORY_STORE_QUEUE] = MemoryStoreService:GetQueue(`CENTRALIZED_QUEUE_{UNIQUE_KEY}_QUEUE_{id}`)
+		properties[INDEX_SERVER_ROLE] = NON_PROCESSOR_SERVER -- Start as a non-processor
+		properties[INDEX_MEMORY_STORE_LOCK] = MemoryStoreService:GetHashMap(MEMORY_STORE_LOCK_FORMAT:format(properties.ClassName, id))
+		properties[INDEX_MEMORY_STORE_QUEUE] =
+			MemoryStoreService:GetQueue(MEMORY_STORE_QUEUE_FORMAT:format(properties.ClassName, id), INVISIBILITY_TIMEOUT)
 
 		return proxy :: CentralizedQueue<T>
 	end
@@ -1169,7 +2072,7 @@ end
 
 -- This background thread periodically calls UpdateSession for all active queues
 -- to refresh locks and handle state transitions.
-task.spawn(function()
+local GlobalSessionUpdateThread = task.spawn(function()
 	while true do
 		task.wait(SESSION_REFRESH_INTERVAL)
 		logMessage(`[CentralizedServer] Periodically refreshing session locks for {#ActiveSessionQueues} active queues.`, INFO_SEVERITY)
@@ -1184,43 +2087,97 @@ game:BindToClose(function()
 	if #ActiveSessionQueues == 0 then return end
 	logMessage(`[CentralizedServer] Server shutting down. Releasing locks for {#ActiveSessionQueues} active queues.`, INFO_SEVERITY)
 
-	local threads = {}
+	local nThreads = #ActiveSessionQueues
+	local mainThread = coroutine.running()
+	task.cancel(GlobalSessionUpdateThread)
+
+	local function shutdownQueue(queue: BaseQueue<any, any>)
+		local queueName = tostring(queue)
+		logMessage(`[CentralizedServer] Shutting down queue {queueName}.`, INFO_SEVERITY)
+		queue:Shutdown()
+		logMessage(`[CentralizedServer] Queue {queueName} has been shut down.`, INFO_SEVERITY)
+		nThreads -= 1
+		if nThreads <= 0 then
+			logMessage("[CentralizedServer] All shutdown threads completed.", INFO_SEVERITY)
+			coroutine.resume(mainThread) -- Resume the main thread to continue shutdown.
+		end
+	end
+
 	for _, queue: BaseQueue<any, any> in ActiveSessionQueues do
-		table.insert(threads, task.spawn(queue.Shutdown, queue))
+		task.defer(shutdownQueue, queue)
 	end
 
 	-- Wait for all shutdown threads to complete.
-	for _, thread in threads do
-		coroutine.yield(thread)
+	if nThreads > 0 then
+		logMessage("[CentralizedServer] Waiting for all shutdown threads to complete...", INFO_SEVERITY)
+		coroutine.yield()
 	end
-
-	logMessage("[CentralizedServer] All queues have been shut down.", INFO_SEVERITY)
+	logMessage("[CentralizedServer] All queues have been shut down.", IMPORTANT_INFO_SEVERITY)
 end)
 
 --// Constructor \\--
 
-Constructor.SetRetryableErrors = function(errors: { [string]: boolean })
+Constructor.SetServerId = function(serverId: string)
+	-- Set the server ID for the current server.
+	if type(serverId) ~= "string" then error("Server ID must be a string.", 2) end
+	if serverId == "" then error("Server ID cannot be an empty string.", 2) end
+
+	ServerId = serverId
+	logMessage(`[Constructor] Server ID set to {serverId}.`, INFO_SEVERITY)
+end
+
+Constructor.SetRetryableErrors = function(errors: { string })
 	-- Set the retryable errors for the retryAsync function.
 	if type(errors) ~= "table" then error("Expected a table of retryable errors.", 2) end
 	if getmetatable(errors :: any) ~= nil then error("Retryable errors must be a plain table without metatable.", 2) end
 
-	for key, value in errors do
-		if type(key) ~= "string" or type(value) ~= "boolean" then
-			error("Retryable errors must be a table of string keys and boolean values.", 2)
-		end
+	local nErrors = #errors
+	if nErrors > 0 and next(errors, nErrors) ~= nil then error("Retryable errors must be a plain array without keys.", 2) end
+
+	local lastIndex: number
+
+	for i, value in ipairs(errors) do
+		if type(value) ~= "string" then error("Retryable errors must be an array of string.", 2) end
+		lastIndex = i + 0
 	end
+
+	if lastIndex ~= nErrors then error("Retryable errors must be a plain array without gaps.", 2) end
 
 	RetryableNetworkErrors = errors
 	logMessage("[Constructor] Retryable errors set successfully.", INFO_SEVERITY)
 end
 
-Constructor.SurpressLogLevel = function(level: number)
+Constructor.SuppressLogLevel = function(level: number)
 	-- Suppress logging for the specified severity level.
 	if type(level) ~= "number" then error("Log level must be a number.", 2) end
-	if level < 1 or level > 5 or level // 1 ~= level then error("Log level must an integer between 1 and 5.", 2) end
+	if level < 1 or level > 5 or level // 1 ~= level then error("Log level must be an integer between 1 and 5.", 2) end
 
-	SurpressedLogLevels[level] = true
+	SuppressedLogLevels[level] = true
 	logMessage(`[Constructor] Log level {level} is now suppressed.`, INFO_SEVERITY)
+end
+
+Constructor.AddLogCallback = function(callback: (message: string, severity: number) -> ())
+	-- Add a callback to be called on every log message.
+	if type(callback) ~= "function" then error("Log callback must be a function.", 2) end
+
+	table.insert(LogCallbacks, callback)
+	logMessage("[Constructor] Log callback added successfully.", INFO_SEVERITY)
+
+	local disconnected = false
+	return function()
+		if disconnected then
+			logMessage("[Constructor] Log callback already disconnected.", WARNING_SEVERITY, true)
+			return
+		end
+
+		local index = table.find(LogCallbacks, callback)
+		if index then
+			logMessage("[Constructor] Disconnecting log callback.", INFO_SEVERITY)
+			table.remove(LogCallbacks, index)
+		end
+
+		disconnected = true
+	end
 end
 
 --// Return \\--
