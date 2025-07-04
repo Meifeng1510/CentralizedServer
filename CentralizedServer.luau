@@ -5,7 +5,7 @@
     ---------------------------------------------
     Author: @meifeng_ft
     Date: 2024-07-03 (Last Updated)
-    Version: 1.2.0 (not tested)
+    Version: 1.2.1 (not tested)
 
     Description:
     This module provides a robust solution for managing a single "main" server
